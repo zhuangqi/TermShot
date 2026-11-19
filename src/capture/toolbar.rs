@@ -1,0 +1,432 @@
+use super::{strokes, Area, Point, Tool, INK};
+use crate::appearance::{fill, rgb, round};
+use windows_sys::Win32::Foundation::{COLORREF, POINT};
+use windows_sys::Win32::Graphics::Gdi::*;
+
+const PANEL: COLORREF = rgb(26, 34, 48);
+const BORDER: COLORREF = rgb(52, 65, 87);
+const ACTIVE: COLORREF = rgb(38, 76, 86);
+const HOVER: COLORREF = rgb(50, 61, 81);
+const ICON: COLORREF = rgb(228, 235, 246);
+const MUTED: COLORREF = rgb(111, 126, 148);
+const ACCENT: COLORREF = rgb(102, 218, 198);
+const ACCENT_HOVER: COLORREF = rgb(151, 237, 222);
+const PADDING: i32 = 6;
+const GAP: i32 = 3;
+const BUTTON_SIZE: i32 = 44;
+const GRIP_WIDTH: i32 = 28;
+const ICON_SIZE: i32 = 22;
+const ICON_LINE_WIDTH: f32 = 2.5;
+const PALETTE_SIZE: i32 = 34;
+const PALETTE_HEIGHT: i32 = PALETTE_SIZE + PADDING * 2;
+pub(super) const HEIGHT: i32 = BUTTON_SIZE + PADDING * 2;
+pub(super) const WIDTH: i32 = 2 * PADDING
+    + GAP * (BUTTONS.len() as i32 - 1)
+    + BUTTON_SIZE * (BUTTONS.len() as i32 - 1)
+    + GRIP_WIDTH;
+
+const COLORS: [COLORREF; 7] = [
+    INK,
+    rgb(245, 147, 38),
+    rgb(247, 212, 55),
+    rgb(24, 170, 120),
+    rgb(43, 123, 246),
+    rgb(245, 247, 250),
+    rgb(27, 29, 33),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Button {
+    Grip,
+    Tool(Tool),
+    Palette,
+    Swatch(COLORREF),
+    Undo,
+    Redo,
+    Cancel,
+    Save,
+}
+
+const BUTTONS: [Button; 12] = [
+    Button::Grip,
+    Button::Tool(Tool::Select),
+    Button::Tool(Tool::Rectangle),
+    Button::Tool(Tool::Arrow),
+    Button::Tool(Tool::Pen),
+    Button::Tool(Tool::Text),
+    Button::Palette,
+    Button::Tool(Tool::Eraser),
+    Button::Undo,
+    Button::Redo,
+    Button::Cancel,
+    Button::Save,
+];
+
+pub(super) struct Layout {
+    pub origin: Point,
+    pub monitor: Area,
+    pub palette_open: bool,
+}
+
+pub(super) struct State {
+    pub active: Tool,
+    pub hovered: Option<Button>,
+    pub color: COLORREF,
+    pub can_undo: bool,
+    pub can_redo: bool,
+}
+
+enum Glyph {
+    Symbol(Button, Area, COLORREF),
+    Swatch(Area, COLORREF, COLORREF),
+}
+
+impl Layout {
+    pub fn panel(&self) -> Area {
+        area_at(self.origin, WIDTH, HEIGHT)
+    }
+
+    pub fn buttons(&self) -> impl Iterator<Item = (Button, Area)> {
+        let mut x = self.origin.x + PADDING;
+        let y = self.origin.y + PADDING;
+        BUTTONS.into_iter().map(move |button| {
+            let width = if button == Button::Grip {
+                GRIP_WIDTH
+            } else {
+                BUTTON_SIZE
+            };
+            let area = area_at(Point { x, y }, width, BUTTON_SIZE);
+            x += width + GAP;
+            (button, area)
+        })
+    }
+
+    fn palette(&self) -> Option<Area> {
+        if !self.palette_open {
+            return None;
+        }
+        let (_, anchor) = self
+            .buttons()
+            .find(|(button, _)| *button == Button::Palette)?;
+        let width = COLORS.len() as i32 * PALETTE_SIZE + 2 * PADDING;
+        let preferred = anchor.left + anchor.width() / 2 - width / 2;
+        let x = preferred.clamp(
+            self.monitor.left,
+            (self.monitor.right - width).max(self.monitor.left),
+        );
+        let top = self.origin.y - PALETTE_HEIGHT - 6;
+        let y = if top >= self.monitor.top {
+            top
+        } else {
+            self.origin.y + HEIGHT + 6
+        };
+        Some(area_at(Point { x, y }, width, PALETTE_HEIGHT))
+    }
+
+    fn swatches(panel: Area) -> impl Iterator<Item = (Button, Area)> {
+        COLORS.into_iter().enumerate().map(move |(index, color)| {
+            let point = Point {
+                x: panel.left + PADDING + index as i32 * PALETTE_SIZE,
+                y: panel.top + PADDING,
+            };
+            (
+                Button::Swatch(color),
+                area_at(point, PALETTE_SIZE, PALETTE_SIZE),
+            )
+        })
+    }
+
+    pub fn hit(&self, point: Point) -> Option<Button> {
+        self.palette()
+            .into_iter()
+            .flat_map(Self::swatches)
+            .chain(self.buttons())
+            .find(|(_, area)| area.contains(point))
+            .map(|(button, _)| button)
+    }
+
+    pub fn contains(&self, point: Point) -> bool {
+        self.panel().contains(point) || self.palette().is_some_and(|area| area.contains(point))
+    }
+
+    pub unsafe fn paint(&self, dc: HDC, state: State, antialias: Option<&strokes::Antialias>) {
+        let mut glyphs = Vec::with_capacity(BUTTONS.len() + COLORS.len());
+        round(dc, &self.panel().rect(), 16, PANEL, BORDER);
+        for (button, area) in self.buttons() {
+            if matches!(button, Button::Palette | Button::Undo | Button::Cancel) {
+                let rule = area_at(
+                    Point {
+                        x: area.left - GAP,
+                        y: area.top + 7,
+                    },
+                    1,
+                    BUTTON_SIZE - 14,
+                );
+                fill(dc, &rule.rect(), BORDER);
+            }
+            let hovered = state.hovered == Some(button);
+            let selected = button == Button::Tool(state.active)
+                || (button == Button::Palette && self.palette_open);
+            let unavailable = (button == Button::Undo && !state.can_undo)
+                || (button == Button::Redo && !state.can_redo);
+            let (background, foreground) = if button == Button::Save {
+                (if hovered { ACCENT_HOVER } else { ACCENT }, PANEL)
+            } else if selected {
+                (ACTIVE, ACCENT_HOVER)
+            } else if hovered && !unavailable {
+                (HOVER, ICON)
+            } else {
+                (
+                    PANEL,
+                    if unavailable || button == Button::Grip {
+                        MUTED
+                    } else {
+                        ICON
+                    },
+                )
+            };
+            if background != PANEL {
+                round(dc, &area.rect(), 10, background, background);
+            }
+            if button == Button::Palette {
+                glyphs.push(Glyph::Swatch(
+                    swatch_bounds(area, 9),
+                    state.color,
+                    foreground,
+                ));
+            } else {
+                glyphs.push(Glyph::Symbol(button, area, foreground));
+            }
+        }
+        if let Some(palette) = self.palette() {
+            round(dc, &palette.rect(), 12, PANEL, BORDER);
+            for (button, area) in Self::swatches(palette) {
+                let Button::Swatch(color) = button else {
+                    unreachable!()
+                };
+                let outline = if color == state.color { ACCENT } else { MUTED };
+                if state.hovered == Some(button) {
+                    round(dc, &area.rect(), 8, HOVER, HOVER);
+                }
+                glyphs.push(Glyph::Swatch(swatch_bounds(area, 10), color, outline));
+            }
+        }
+        // Keep the GDI backgrounds and the GDI+ icon layer in separate passes.
+        let drawn = antialias.is_some_and(|renderer| {
+            renderer.draw(dc, self.monitor, |canvas| {
+                glyphs.iter().all(|glyph| glyph.paint(dc, Some(canvas)))
+            })
+        });
+        if !drawn {
+            for glyph in &glyphs {
+                glyph.paint(dc, None);
+            }
+        }
+    }
+}
+
+fn area_at(point: Point, width: i32, height: i32) -> Area {
+    Area {
+        left: point.x,
+        top: point.y,
+        right: point.x + width,
+        bottom: point.y + height,
+    }
+}
+
+fn swatch_bounds(area: Area, radius: i32) -> Area {
+    let x = area.left + area.width() / 2;
+    let y = area.top + area.height() / 2;
+    area_at(
+        Point {
+            x: x - radius,
+            y: y - radius,
+        },
+        radius * 2,
+        radius * 2,
+    )
+}
+
+impl Glyph {
+    unsafe fn paint(&self, dc: HDC, canvas: Option<&strokes::Canvas>) -> bool {
+        match *self {
+            Self::Symbol(button, area, color) => paint_icon(dc, canvas, button, area, color),
+            Self::Swatch(area, color, outline) => {
+                if let Some(canvas) = canvas {
+                    let inner = Area {
+                        left: area.left + 1,
+                        top: area.top + 1,
+                        right: area.right - 1,
+                        bottom: area.bottom - 1,
+                    };
+                    canvas.disc(area, outline) && canvas.disc(inner, color)
+                } else {
+                    round(dc, &area.rect(), area.width(), color, outline);
+                    true
+                }
+            }
+        }
+    }
+}
+
+unsafe fn paint_icon(
+    dc: HDC,
+    canvas: Option<&strokes::Canvas>,
+    button: Button,
+    area: Area,
+    color: COLORREF,
+) -> bool {
+    let origin = Point {
+        x: area.left + (area.width() - ICON_SIZE) / 2,
+        y: area.top + (area.height() - ICON_SIZE) / 2,
+    };
+    let scale = |units: i32| units as f32 * ICON_SIZE as f32 / 16.0;
+    if button == Button::Grip {
+        return [3, 7, 11].into_iter().all(|y| {
+            [5, 9].into_iter().all(|x| {
+                let dot = area_at(
+                    origin
+                        + Point {
+                            x: scale(x).round() as i32,
+                            y: scale(y).round() as i32,
+                        },
+                    3,
+                    3,
+                );
+                if let Some(canvas) = canvas {
+                    canvas.disc(dot, color)
+                } else {
+                    fill(dc, &dot.rect(), color);
+                    true
+                }
+            })
+        });
+    }
+    let geometry = icon_paths(button);
+    if let Some(canvas) = canvas {
+        let paths: Vec<Vec<_>> = geometry
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|&(x, y)| strokes::PointF {
+                        X: origin.x as f32 + scale(x),
+                        Y: origin.y as f32 + scale(y),
+                    })
+                    .collect()
+            })
+            .collect();
+        return canvas.lines(color, ICON_LINE_WIDTH, paths.iter().map(Vec::as_slice));
+    }
+    let pen = CreatePen(PS_SOLID, ICON_LINE_WIDTH.round() as i32, color);
+    if pen.is_null() {
+        return false;
+    }
+    let previous = SelectObject(dc, pen);
+    for line in geometry {
+        let points: Vec<_> = line
+            .iter()
+            .map(|&(x, y)| POINT {
+                x: origin.x + scale(x).round() as i32,
+                y: origin.y + scale(y).round() as i32,
+            })
+            .collect();
+        Polyline(dc, points.as_ptr(), points.len() as i32);
+    }
+    SelectObject(dc, previous);
+    DeleteObject(pen);
+    true
+}
+
+type IconPath = &'static [(i32, i32)];
+
+fn icon_paths(button: Button) -> &'static [IconPath] {
+    match button {
+        Button::Tool(Tool::Select) => &[&[
+            (3, 1),
+            (3, 13),
+            (6, 10),
+            (9, 15),
+            (11, 14),
+            (8, 9),
+            (13, 9),
+            (3, 1),
+        ]],
+        Button::Tool(Tool::Rectangle) => &[&[(1, 3), (15, 3), (15, 13), (1, 13), (1, 3)]],
+        Button::Tool(Tool::Arrow) => &[&[(2, 14), (14, 2)], &[(7, 2), (14, 2), (14, 9)]],
+        Button::Tool(Tool::Pen) => {
+            &[&[(2, 13), (5, 6), (7, 5), (8, 11), (10, 12), (12, 7), (15, 5)]]
+        }
+        Button::Tool(Tool::Text) => &[&[(2, 3), (14, 3)], &[(8, 3), (8, 14)], &[(5, 14), (11, 14)]],
+        Button::Tool(Tool::Eraser) => &[
+            &[(1, 10), (9, 2), (15, 8), (9, 14), (5, 14), (1, 10)],
+            &[(5, 6), (12, 12)],
+        ],
+        Button::Undo => &[
+            &[(1, 6), (10, 6), (13, 8), (13, 12), (11, 14), (7, 14)],
+            &[(5, 2), (1, 6), (5, 10)],
+        ],
+        Button::Redo => &[
+            &[(15, 6), (6, 6), (3, 8), (3, 12), (5, 14), (9, 14)],
+            &[(11, 2), (15, 6), (11, 10)],
+        ],
+        Button::Cancel => &[&[(3, 3), (13, 13)], &[(13, 3), (3, 13)]],
+        Button::Save => &[&[(2, 8), (6, 12), (14, 4)]],
+        Button::Grip | Button::Palette | Button::Swatch(_) => &[],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::Bitmap;
+
+    #[test]
+    fn toolbar_icons_blend_edges_into_panel() {
+        let monitor = area_at(Point { x: 0, y: 0 }, WIDTH + 40, HEIGHT + 40);
+        let layout = Layout {
+            origin: Point { x: 12, y: 10 },
+            monitor,
+            palette_open: false,
+        };
+        let bitmap = Bitmap::new(monitor.width(), monitor.height()).unwrap();
+        let antialias = strokes::Antialias::new().unwrap();
+        unsafe {
+            layout.paint(
+                bitmap.dc,
+                State {
+                    active: Tool::Rectangle,
+                    hovered: None,
+                    color: INK,
+                    can_undo: false,
+                    can_redo: false,
+                },
+                Some(&antialias),
+            );
+            GdiFlush();
+        }
+        for (button, foreground) in [
+            (Button::Grip, MUTED),
+            (Button::Tool(Tool::Arrow), ICON),
+            (Button::Tool(Tool::Pen), ICON),
+            (Button::Palette, ICON),
+            (Button::Cancel, ICON),
+        ] {
+            let (_, area) = layout
+                .buttons()
+                .find(|(candidate, _)| *candidate == button)
+                .unwrap();
+            let center = Point {
+                x: area.left + area.width() / 2,
+                y: area.top + area.height() / 2,
+            };
+            let has_blended_pixel = (center.y - 11..center.y + 11).any(|y| {
+                (center.x - 11..center.x + 11).any(|x| {
+                    let index = (y * monitor.width() + x) as usize * 4;
+                    let red = u32::from(bitmap.bytes()[index + 2]);
+                    (PANEL & 0xff) < red && red < (foreground & 0xff)
+                })
+            });
+            assert!(has_blended_pixel, "no antialiasing in {button:?}");
+        }
+    }
+}
