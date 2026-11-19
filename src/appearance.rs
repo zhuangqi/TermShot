@@ -2,6 +2,9 @@ use crate::storage::wide;
 use windows_sys::Win32::Foundation::{COLORREF, RECT};
 use windows_sys::Win32::Graphics::Gdi::*;
 
+mod smooth;
+pub use smooth::{argb, GdiPlus};
+
 pub const WHITE: u32 = rgb(255, 255, 255);
 pub const WINDOW: COLORREF = rgb(24, 24, 28);
 pub const PANEL: COLORREF = rgb(32, 32, 37);

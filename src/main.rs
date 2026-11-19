@@ -4,6 +4,7 @@ mod appearance;
 mod background;
 mod capture;
 mod preferences;
+mod startup;
 mod storage;
 
 use background::{Background, Outcome};
@@ -21,8 +22,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-const APP_NAME: &str = "CliScreenshot";
+const APP_NAME: &str = "TermShot";
+const LEGACY_APP_NAME: &str = "CliScreenshot";
 const ICON_RESOURCE: *const u16 = 101usize as *const u16;
+// Share the instance lock and controller class with the old executable.
+const INSTANCE_NAME: &str = "Local\\CliScreenshot.Instance";
 const CONTROLLER_CLASS: &str = "CliScreenshot.Controller";
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_CAPTURE_FINISHED: u32 = WM_APP + 2;
@@ -69,17 +73,22 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
+    let starting_at_login = std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == startup::ARG);
     unsafe {
-        let mutex = CreateMutexW(null(), 0, wide("Local\\CliScreenshot.Instance").as_ptr());
+        let mutex = CreateMutexW(null(), 0, wide(INSTANCE_NAME).as_ptr());
         if mutex.is_null() {
             return Err(io::Error::last_os_error());
         }
         let already_running = GetLastError() == ERROR_ALREADY_EXISTS;
         let _instance_lock = InstanceLock(mutex);
         if already_running {
-            let running = FindWindowW(wide(CONTROLLER_CLASS).as_ptr(), null());
-            if !running.is_null() {
-                PostMessageW(running, WM_OPEN_SETTINGS, 0, 0);
+            if !starting_at_login {
+                let running = FindWindowW(wide(CONTROLLER_CLASS).as_ptr(), null());
+                if !running.is_null() {
+                    PostMessageW(running, WM_OPEN_SETTINGS, 0, 0);
+                }
             }
             return Ok(());
         }
@@ -147,6 +156,9 @@ fn run() -> io::Result<()> {
         let hotkey = app.settings.hotkey.label();
         APP.with(|slot| slot.replace(Some(app)));
         request_cleanup(hwnd);
+        if let Err(error) = startup::update_legacy_executable() {
+            alert(hwnd, &format!("无法更新开机启动路径。\n{error}"));
+        }
         if let Err(error) = settings {
             alert(
                 hwnd,
@@ -390,7 +402,11 @@ impl App {
         }
     }
 
-    fn apply_settings(&mut self, settings: Settings) -> Result<(), String> {
+    fn apply_settings(
+        &mut self,
+        settings: Settings,
+        startup_change: Option<bool>,
+    ) -> Result<(), String> {
         let new_id = if self.hotkey_id.is_none() || settings.hotkey != self.settings.hotkey {
             let id = if self.hotkey_id == Some(1) { 2 } else { 1 };
             if !self.register_hotkey(settings.hotkey, id) {
@@ -403,13 +419,29 @@ impl App {
         } else {
             None
         };
-        if let Err(error) = self.storage.save_settings(settings) {
+        let saved = (|| {
+            let previous_startup = startup_change
+                .map(startup::set_enabled)
+                .transpose()
+                .map_err(|error| format!("无法更改开机启动设置。\n{error}"))?;
+            if let Err(error) = self.storage.save_settings(settings) {
+                let mut message = format!("无法保存设置。\n{error}");
+                if let Some(previous) = previous_startup {
+                    if let Err(error) = previous.restore() {
+                        message.push_str(&format!("\n无法还原开机启动设置。\n{error}"));
+                    }
+                }
+                return Err(message);
+            }
+            Ok(())
+        })();
+        if let Err(error) = saved {
             if let Some(id) = new_id {
                 unsafe {
                     UnregisterHotKey(self.hwnd, id);
                 }
             }
-            return Err(format!("无法保存设置。\n{error}"));
+            return Err(error);
         }
         if let Some(id) = new_id {
             if let Some(old) = self.hotkey_id.replace(id) {

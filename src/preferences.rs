@@ -1,32 +1,38 @@
 use crate::appearance::{
-    fill, label, primary_fill, round, selected_fill, ACCENT_TEXT, BORDER, CONTROL_BORDER,
+    fill, label, primary_fill, rgb, round, selected_fill, GdiPlus, ACCENT_TEXT, BORDER,
     CONTROL_CORNER, FIELD, FOCUS_BORDER, FOOTER, HOVER, PANEL, PANEL_CORNER, PRESSED, SECONDARY,
-    SELECTED_BORDER, SELECTED_TEXT, TEXT, WINDOW,
+    SELECTED_TEXT, TEXT, WINDOW,
 };
 use crate::storage::{key_label, keys, wide, Hotkey, Settings};
-use crate::{alert, control_text, create_control, register_class, with_app, APP_NAME};
+use crate::{alert, control_text, create_control, register_class, startup, with_app, APP_NAME};
 use std::io;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::*;
 use windows_sys::Win32::Graphics::Gdi::*;
+use windows_sys::Win32::Graphics::GdiPlus::PointF;
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-const CLASS: &str = "CliScreenshot.Preferences";
+const CLASS: &str = "TermShot.Preferences";
 const WIDTH: i32 = 400;
-const HEIGHT: i32 = 156;
+const HEIGHT: i32 = FOOTER_TOP + 42;
 const PAGE_INSET: i32 = 12;
 const CONTENT_LEFT: i32 = PAGE_INSET + 12;
 const CONTENT_RIGHT: i32 = WIDTH - CONTENT_LEFT;
 const ROW_HEIGHT: i32 = 46;
+const ROW_COUNT: i32 = 3;
 const SHORTCUT_Y: i32 = PAGE_INSET + ROW_HEIGHT / 2;
 const RETENTION_Y: i32 = SHORTCUT_Y + ROW_HEIGHT;
-const FOOTER_TOP: i32 = PAGE_INSET + 2 * ROW_HEIGHT + 10;
+const STARTUP_Y: i32 = RETENTION_Y + ROW_HEIGHT;
+const FOOTER_TOP: i32 = PAGE_INSET + ROW_COUNT * ROW_HEIGHT + 10;
 const FIELD_HEIGHT: i32 = 28;
+const CONTROL_DIAMETER: i32 = 14;
+const CONTROL_BORDER: COLORREF = rgb(59, 59, 69);
+const SELECTED_BORDER: COLORREF = rgb(156, 78, 95);
 const ICON_SIZE: i32 = 24;
 const LABEL_X: i32 = CONTENT_LEFT + ICON_SIZE + 8;
 const LABEL_WIDTH: i32 = 88;
@@ -39,8 +45,10 @@ const SHIFT: i32 = 202;
 const ALT: i32 = 203;
 const KEY: i32 = 204;
 const MINUTES: i32 = 205;
+const STARTUP: i32 = 206;
 const SHORTCUT_LABEL: i32 = 211;
 const RETENTION_LABEL: i32 = 212;
+const STARTUP_LABEL: i32 = 213;
 const MODIFIERS: [(i32, u32); 3] = [(CTRL, MOD_CONTROL), (SHIFT, MOD_SHIFT), (ALT, MOD_ALT)];
 const TOGGLE: u32 = BS_AUTOCHECKBOX as u32 | BS_PUSHLIKE as u32 | WS_TABSTOP;
 const ACTION: u32 = BS_OWNERDRAW as u32 | WS_TABSTOP;
@@ -48,6 +56,8 @@ const ACTION: u32 = BS_OWNERDRAW as u32 | WS_TABSTOP;
 type Bounds = (i32, i32, i32, i32);
 const SHORTCUT_TOP: i32 = SHORTCUT_Y - FIELD_HEIGHT / 2;
 const RETENTION_TOP: i32 = RETENTION_Y - FIELD_HEIGHT / 2;
+const STARTUP_TOP: i32 = STARTUP_Y - FIELD_HEIGHT / 2;
+const SWITCH_WIDTH: i32 = 44;
 const KEY_X: i32 = CONTENT_RIGHT - KEY_WIDTH;
 const KEY_SEPARATOR: Bounds = (KEY_X - 16, SHORTCUT_TOP, 16, FIELD_HEIGHT);
 const NUMBER_FIELD: Bounds = (CONTENT_RIGHT - 118, RETENTION_TOP, 118, FIELD_HEIGHT);
@@ -58,7 +68,7 @@ const ACTION_HEIGHT: i32 = 26;
 const SAVE_WIDTH: i32 = 78;
 const SAVE_X: i32 = WIDTH - PAGE_INSET - SAVE_WIDTH;
 const CANCEL_WIDTH: i32 = 58;
-const CONTROLS: [(i32, &str, &str, u32, Bounds); 9] = [
+const CONTROLS: [(i32, &str, &str, u32, Bounds); 11] = [
     (
         SHORTCUT_LABEL,
         "STATIC",
@@ -118,6 +128,25 @@ const CONTROLS: [(i32, &str, &str, u32, Bounds); 9] = [
         MINUTES_INPUT,
     ),
     (
+        STARTUP_LABEL,
+        "STATIC",
+        "开机启动",
+        0,
+        (LABEL_X, STARTUP_TOP, LABEL_WIDTH, FIELD_HEIGHT),
+    ),
+    (
+        STARTUP,
+        "BUTTON",
+        "开机启动",
+        TOGGLE,
+        (
+            CONTENT_RIGHT - SWITCH_WIDTH,
+            STARTUP_TOP,
+            SWITCH_WIDTH,
+            FIELD_HEIGHT,
+        ),
+    ),
+    (
         IDCANCEL,
         "BUTTON",
         "取消",
@@ -140,6 +169,8 @@ const CONTROLS: [(i32, &str, &str, u32, Bounds); 9] = [
 
 struct Style {
     dpi: u32,
+    initial_startup: Option<bool>,
+    gdi_plus: Option<GdiPlus>,
     body: HFONT,
     strong: HFONT,
     small: HFONT,
@@ -148,14 +179,57 @@ struct Style {
 }
 
 impl Style {
-    unsafe fn new(dpi: u32) -> Self {
+    unsafe fn new(dpi: u32, initial_startup: Option<bool>) -> Self {
         Self {
             dpi,
+            initial_startup,
+            gdi_plus: GdiPlus::new(),
             body: create_font(12, FW_NORMAL, dpi),
             strong: create_font(13, FW_SEMIBOLD, dpi),
             small: create_font(11, FW_NORMAL, dpi),
             row: CreateSolidBrush(PANEL),
             field: CreateSolidBrush(FIELD),
+        }
+    }
+
+    unsafe fn round(&self, dc: HDC, bounds: &RECT, diameter: i32, surface: u32, border: u32) {
+        if !self
+            .gdi_plus
+            .as_ref()
+            .is_some_and(|renderer| renderer.round(dc, bounds, diameter, surface, border))
+        {
+            round(dc, bounds, diameter, surface, border);
+        }
+    }
+
+    unsafe fn stroke(&self, dc: HDC, points: &[(i32, i32)], color: COLORREF) {
+        let width = scale(1, self.dpi);
+        let points: Vec<_> = points
+            .iter()
+            .map(|&(x, y)| POINT {
+                x: scale(x, self.dpi),
+                y: scale(y, self.dpi),
+            })
+            .collect();
+        if self.gdi_plus.as_ref().is_some_and(|renderer| {
+            let offset = (width % 2) as f32 / 2.0;
+            let points: Vec<_> = points
+                .iter()
+                .map(|point| PointF {
+                    X: point.x as f32 + offset,
+                    Y: point.y as f32 + offset,
+                })
+                .collect();
+            renderer.stroke(dc, &points, width as f32, color)
+        }) {
+            return;
+        }
+        let pen = CreatePen(PS_SOLID, width, color);
+        if !pen.is_null() {
+            let previous = SelectObject(dc, pen);
+            Polyline(dc, points.as_ptr(), points.len() as i32);
+            SelectObject(dc, previous);
+            DeleteObject(pen);
         }
     }
 }
@@ -177,6 +251,7 @@ pub fn register(instance: HINSTANCE) -> io::Result<()> {
 }
 
 pub fn open(instance: HINSTANCE, initial: Settings) -> io::Result<HWND> {
+    let initial_startup = startup::is_enabled().ok();
     unsafe {
         let mut cursor = POINT::default();
         GetCursorPos(&mut cursor);
@@ -194,7 +269,7 @@ pub fn open(instance: HINSTANCE, initial: Settings) -> io::Result<HWND> {
         let hwnd = CreateWindowExW(
             ex_style,
             wide(CLASS).as_ptr(),
-            wide("CliScreenshot 设置").as_ptr(),
+            wide(format!("{APP_NAME} 设置")).as_ptr(),
             style,
             work.left,
             work.top,
@@ -233,7 +308,7 @@ pub fn open(instance: HINSTANCE, initial: Settings) -> io::Result<HWND> {
         SetWindowLongPtrW(
             hwnd,
             GWLP_USERDATA,
-            Box::into_raw(Box::new(Style::new(dpi))) as isize,
+            Box::into_raw(Box::new(Style::new(dpi, initial_startup))) as isize,
         );
         for (id, class, name, style, bounds) in CONTROLS {
             let rect = rect(bounds, dpi);
@@ -255,7 +330,7 @@ pub fn open(instance: HINSTANCE, initial: Settings) -> io::Result<HWND> {
                 DestroyWindow(hwnd);
                 return Err(error);
             }
-            if matches!(id, CTRL | SHIFT | ALT | KEY | IDOK | IDCANCEL)
+            if matches!(id, CTRL | SHIFT | ALT | KEY | STARTUP | IDOK | IDCANCEL)
                 && SetWindowSubclass(control, Some(control_proc), 1, id as usize) == 0
             {
                 DestroyWindow(hwnd);
@@ -308,6 +383,16 @@ pub fn open(instance: HINSTANCE, initial: Settings) -> io::Result<HWND> {
             minutes,
             wide(initial.retention_minutes.to_string()).as_ptr(),
         );
+        let startup = GetDlgItem(hwnd, STARTUP);
+        match initial_startup {
+            Some(true) => {
+                SendMessageW(startup, BM_SETCHECK, BST_CHECKED as usize, 0);
+            }
+            Some(false) => {}
+            None => {
+                EnableWindow(startup, 0);
+            }
+        }
         SetWindowPos(
             hwnd,
             null_mut(),
@@ -387,11 +472,11 @@ unsafe extern "system" fn window_proc(
             return 1;
         }
         WM_COMMAND => match ((wparam & 0xffff) as i32, (wparam >> 16) as u32) {
-            (IDOK, BN_CLICKED) => save(hwnd),
+            (IDOK, BN_CLICKED) if !style.is_null() => save(hwnd, (*style).initial_startup),
             (IDCANCEL, BN_CLICKED) => {
                 DestroyWindow(hwnd);
             }
-            (id @ (CTRL | SHIFT | ALT), BN_CLICKED) => {
+            (id @ (CTRL | SHIFT | ALT | STARTUP), BN_CLICKED) => {
                 InvalidateRect(GetDlgItem(hwnd, id), null(), 0);
             }
             (KEY, CBN_SELCHANGE | CBN_DROPDOWN | CBN_CLOSEUP) => {
@@ -408,7 +493,7 @@ unsafe extern "system" fn window_proc(
         WM_DPICHANGED if lparam != 0 && !style.is_null() => {
             let dpi = (wparam & 0xffff) as u32;
             let suggested = &*(lparam as *const RECT);
-            let old = std::ptr::replace(style, Style::new(dpi));
+            let old = std::ptr::replace(style, Style::new(dpi, (*style).initial_startup));
             SetWindowPos(
                 hwnd,
                 null_mut(),
@@ -448,10 +533,10 @@ unsafe extern "system" fn control_proc(
 ) -> LRESULT {
     let id = id as i32;
     match message {
-        WM_PAINT if matches!(id, CTRL | SHIFT | ALT | KEY) => {
+        WM_PAINT if matches!(id, CTRL | SHIFT | ALT | KEY | STARTUP) => {
             let style = GetWindowLongPtrW(GetParent(hwnd), GWLP_USERDATA) as *const Style;
             if !style.is_null() {
-                paint_key_control(hwnd, id, &*style);
+                paint_control(hwnd, id, &*style);
                 return 0;
             }
         }
@@ -492,14 +577,14 @@ unsafe fn paint_page(hwnd: HWND, style: &Style) {
     GetClientRect(hwnd, &mut client);
     fill(dc, &client, WINDOW);
 
-    round(
+    style.round(
         dc,
         &rect(
             (
                 PAGE_INSET,
                 PAGE_INSET,
                 WIDTH - 2 * PAGE_INSET,
-                2 * ROW_HEIGHT,
+                ROW_COUNT * ROW_HEIGHT,
             ),
             dpi,
         ),
@@ -507,14 +592,15 @@ unsafe fn paint_page(hwnd: HWND, style: &Style) {
         PANEL,
         BORDER,
     );
-    let divider = PAGE_INSET + ROW_HEIGHT;
-    stroke(
-        dc,
-        &[(CONTENT_LEFT, divider), (CONTENT_RIGHT, divider)],
-        BORDER,
-        dpi,
-    );
-    paint_row_icons(dc, dpi);
+    for row in 1..ROW_COUNT {
+        let divider = PAGE_INSET + row * ROW_HEIGHT;
+        style.stroke(
+            dc,
+            &[(CONTENT_LEFT, divider), (CONTENT_RIGHT, divider)],
+            BORDER,
+        );
+    }
+    paint_row_icons(dc, style);
     text(
         dc,
         style.small,
@@ -525,10 +611,10 @@ unsafe fn paint_page(hwnd: HWND, style: &Style) {
     );
 
     let minutes = GetDlgItem(hwnd, MINUTES);
-    round(
+    style.round(
         dc,
         &rect(NUMBER_FIELD, dpi),
-        scale(CONTROL_CORNER, dpi),
+        scale(CONTROL_DIAMETER, dpi),
         FIELD,
         if GetFocus() == minutes {
             FOCUS_BORDER
@@ -567,7 +653,7 @@ unsafe fn paint_page(hwnd: HWND, style: &Style) {
     for (x, width, key, action) in [(PAGE_INSET, 34, "Enter", "保存"), (84, 28, "Esc", "取消")]
     {
         let keycap = rect((x, hint_top, width, 18), dpi);
-        round(dc, &keycap, scale(6, dpi), WINDOW, BORDER);
+        style.round(dc, &keycap, scale(6, dpi), WINDOW, BORDER);
         text(dc, style.small, key, keycap, SECONDARY, DT_CENTER);
         text(
             dc,
@@ -581,9 +667,10 @@ unsafe fn paint_page(hwnd: HWND, style: &Style) {
     EndPaint(hwnd, &paint);
 }
 
-unsafe fn paint_row_icons(dc: HDC, dpi: u32) {
-    for y in [SHORTCUT_Y, RETENTION_Y] {
-        round(
+unsafe fn paint_row_icons(dc: HDC, style: &Style) {
+    let dpi = style.dpi;
+    for y in [SHORTCUT_Y, RETENTION_Y, STARTUP_Y] {
+        style.round(
             dc,
             &rect((CONTENT_LEFT, y - ICON_SIZE / 2, ICON_SIZE, ICON_SIZE), dpi),
             scale(CONTROL_CORNER, dpi),
@@ -592,7 +679,7 @@ unsafe fn paint_row_icons(dc: HDC, dpi: u32) {
         );
     }
     let center = CONTENT_LEFT + ICON_SIZE / 2;
-    round(
+    style.round(
         dc,
         &rect((center - 8, SHORTCUT_Y - 5, 16, 10), dpi),
         scale(4, dpi),
@@ -600,27 +687,25 @@ unsafe fn paint_row_icons(dc: HDC, dpi: u32) {
         SECONDARY,
     );
     for x in [center - 5, center - 1, center + 3] {
-        stroke(
+        style.stroke(
             dc,
             &[(x, SHORTCUT_Y - 2), (x + 2, SHORTCUT_Y - 2)],
             SECONDARY,
-            dpi,
         );
     }
-    stroke(
+    style.stroke(
         dc,
         &[(center - 4, SHORTCUT_Y + 2), (center + 4, SHORTCUT_Y + 2)],
         SECONDARY,
-        dpi,
     );
-    round(
+    style.round(
         dc,
         &rect((center - 7, RETENTION_Y - 7, 14, 14), dpi),
         scale(14, dpi),
         HOVER,
         SECONDARY,
     );
-    stroke(
+    style.stroke(
         dc,
         &[
             (center, RETENTION_Y - 4),
@@ -628,23 +713,81 @@ unsafe fn paint_row_icons(dc: HDC, dpi: u32) {
             (center + 3, RETENTION_Y + 2),
         ],
         SECONDARY,
-        dpi,
+    );
+    style.round(
+        dc,
+        &rect((center - 7, STARTUP_Y - 6, 14, 10), dpi),
+        scale(3, dpi),
+        HOVER,
+        SECONDARY,
+    );
+    style.stroke(
+        dc,
+        &[(center, STARTUP_Y + 3), (center, STARTUP_Y + 7)],
+        SECONDARY,
+    );
+    style.stroke(
+        dc,
+        &[(center - 4, STARTUP_Y + 7), (center + 5, STARTUP_Y + 7)],
+        SECONDARY,
     );
 }
 
-unsafe fn paint_key_control(hwnd: HWND, id: i32, style: &Style) {
+unsafe fn paint_control(hwnd: HWND, id: i32, style: &Style) {
     let mut paint = PAINTSTRUCT::default();
     let dc = BeginPaint(hwnd, &mut paint);
     let mut client = RECT::default();
     GetClientRect(hwnd, &mut client);
     fill(dc, &client, PANEL);
-    let caption = String::from_utf16_lossy(&control_text(hwnd));
-    if id == KEY {
-        paint_combo(dc, hwnd, client, &caption, style);
+    if id == STARTUP {
+        paint_switch(dc, hwnd, client, style);
     } else {
-        paint_modifier(dc, hwnd, client, &caption, style);
+        let caption = String::from_utf16_lossy(&control_text(hwnd));
+        if id == KEY {
+            paint_combo(dc, hwnd, client, &caption, style);
+        } else {
+            paint_modifier(dc, hwnd, client, &caption, style);
+        }
     }
     EndPaint(hwnd, &paint);
+}
+
+unsafe fn paint_switch(dc: HDC, hwnd: HWND, bounds: RECT, style: &Style) {
+    if style.initial_startup.is_none() {
+        text(dc, style.small, "不可用", bounds, SECONDARY, DT_CENTER);
+        return;
+    }
+    let dpi = style.dpi;
+    let checked = SendMessageW(hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
+    let pressed = SendMessageW(hwnd, BM_GETSTATE, 0, 0) & BST_PUSHED as isize != 0;
+    let hovered = is_hovered(hwnd);
+    let (surface, edge, thumb) = if checked {
+        let accent = primary_fill(hovered, pressed);
+        (accent, accent, ACCENT_TEXT)
+    } else {
+        let surface = if hovered || pressed { HOVER } else { FIELD };
+        (surface, CONTROL_BORDER, SECONDARY)
+    };
+    let edge = if GetFocus() == hwnd {
+        FOCUS_BORDER
+    } else {
+        edge
+    };
+    style.round(
+        dc,
+        &rect((0, 3, SWITCH_WIDTH, 22), dpi),
+        scale(22, dpi),
+        surface,
+        edge,
+    );
+    let thumb_x = if checked { SWITCH_WIDTH - 18 } else { 4 };
+    style.round(
+        dc,
+        &rect((thumb_x, 7, 14, 14), dpi),
+        scale(14, dpi),
+        thumb,
+        thumb,
+    );
 }
 
 unsafe fn paint_modifier(dc: HDC, hwnd: HWND, bounds: RECT, caption: &str, style: &Style) {
@@ -664,17 +807,12 @@ unsafe fn paint_modifier(dc: HDC, hwnd: HWND, bounds: RECT, caption: &str, style
     } else {
         edge
     };
-    round(dc, &bounds, scale(CONTROL_CORNER, dpi), surface, edge);
+    style.round(dc, &bounds, scale(CONTROL_DIAMETER, dpi), surface, edge);
     let center = FIELD_HEIGHT / 2;
     if checked {
-        stroke(
-            dc,
-            &[(6, center), (9, center + 3), (14, center - 3)],
-            ink,
-            dpi,
-        );
+        style.stroke(dc, &[(6, center), (9, center + 3), (14, center - 3)], ink);
     } else {
-        round(
+        style.round(
             dc,
             &rect((7, center - 3, 6, 6), dpi),
             scale(6, dpi),
@@ -710,7 +848,7 @@ unsafe fn paint_combo(dc: HDC, hwnd: HWND, bounds: RECT, caption: &str, style: &
     } else {
         border
     };
-    round(dc, &bounds, scale(CONTROL_CORNER, dpi), surface, edge);
+    style.round(dc, &bounds, scale(CONTROL_DIAMETER, dpi), surface, edge);
     let split = bounds.right - scale(KEY_ARROW_WIDTH, dpi);
     fill(
         dc,
@@ -725,7 +863,7 @@ unsafe fn paint_combo(dc: HDC, hwnd: HWND, bounds: RECT, caption: &str, style: &
     let center_x = KEY_WIDTH - KEY_ARROW_WIDTH / 2;
     let center_y = FIELD_HEIGHT / 2;
     let (ends, tip) = if expanded { (2, -2) } else { (-2, 2) };
-    stroke(
+    style.stroke(
         dc,
         &[
             (center_x - 4, center_y + ends),
@@ -733,7 +871,6 @@ unsafe fn paint_combo(dc: HDC, hwnd: HWND, bounds: RECT, caption: &str, style: &
             (center_x + 4, center_y + ends),
         ],
         ink,
-        dpi,
     );
     text(
         dc,
@@ -758,10 +895,10 @@ unsafe fn paint_key_option(item: &DRAWITEMSTRUCT, style: &Style) {
     if selected {
         let mut highlight = item.rcItem;
         InflateRect(&mut highlight, -scale(4, dpi), -scale(2, dpi));
-        round(
+        style.round(
             item.hDC,
             &highlight,
-            scale(CONTROL_CORNER, dpi),
+            scale(CONTROL_DIAMETER, dpi),
             selected_fill(false),
             SELECTED_BORDER,
         );
@@ -794,10 +931,10 @@ unsafe fn paint_action(item: &DRAWITEMSTRUCT, style: &Style) {
     };
     let border = if focused { FOCUS_BORDER } else { border };
     fill(item.hDC, &item.rcItem, FOOTER);
-    round(
+    style.round(
         item.hDC,
         &item.rcItem,
-        scale(CONTROL_CORNER, style.dpi),
+        scale(CONTROL_DIAMETER, style.dpi),
         surface,
         border,
     );
@@ -807,23 +944,6 @@ unsafe fn paint_action(item: &DRAWITEMSTRUCT, style: &Style) {
 unsafe fn is_hovered(hwnd: HWND) -> bool {
     let mut cursor = POINT::default();
     GetCursorPos(&mut cursor) != 0 && WindowFromPoint(cursor) == hwnd
-}
-
-unsafe fn stroke(dc: HDC, points: &[(i32, i32)], color: COLORREF, dpi: u32) {
-    let pen = CreatePen(PS_SOLID, scale(1, dpi), color);
-    if !pen.is_null() {
-        let previous = SelectObject(dc, pen);
-        let points: Vec<_> = points
-            .iter()
-            .map(|&(x, y)| POINT {
-                x: scale(x, dpi),
-                y: scale(y, dpi),
-            })
-            .collect();
-        Polyline(dc, points.as_ptr(), points.len() as i32);
-        SelectObject(dc, previous);
-        DeleteObject(pen);
-    }
 }
 
 unsafe fn text(dc: HDC, font: HFONT, caption: &str, bounds: RECT, color: COLORREF, alignment: u32) {
@@ -838,7 +958,7 @@ unsafe fn text(dc: HDC, font: HFONT, caption: &str, bounds: RECT, color: COLORRE
     }
 }
 
-unsafe fn save(hwnd: HWND) {
+unsafe fn save(hwnd: HWND, initial_startup: Option<bool>) {
     let mut modifiers = 0;
     for (id, flag) in MODIFIERS {
         if SendMessageW(GetDlgItem(hwnd, id), BM_GETCHECK, 0, 0) == BST_CHECKED as isize {
@@ -862,11 +982,19 @@ unsafe fn save(hwnd: HWND) {
         SetFocus(input);
         return;
     };
+    let startup =
+        SendMessageW(GetDlgItem(hwnd, STARTUP), BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
+    let startup_change = initial_startup
+        .filter(|&initial| initial != startup)
+        .map(|_| startup);
     match with_app(|app| {
-        app.apply_settings(Settings {
-            hotkey,
-            retention_minutes,
-        })
+        app.apply_settings(
+            Settings {
+                hotkey,
+                retention_minutes,
+            },
+            startup_change,
+        )
     }) {
         Some(Ok(())) => {
             if let Some(owner) = with_app(|app| app.hwnd) {
@@ -884,13 +1012,11 @@ unsafe fn layout(hwnd: HWND) {
     let dc = GetDC(hwnd);
     for (id, _, _, _, bounds) in CONTROLS {
         let control = GetDlgItem(hwnd, id);
-        let font = match id {
-            SHORTCUT_LABEL | RETENTION_LABEL => style.strong,
-            _ => style.body,
-        };
+        let is_label = matches!(id, SHORTCUT_LABEL | RETENTION_LABEL | STARTUP_LABEL);
+        let font = if is_label { style.strong } else { style.body };
         SendMessageW(control, WM_SETFONT, font as usize, 0);
         let mut rect = rect(bounds, style.dpi);
-        if !dc.is_null() && matches!(id, SHORTCUT_LABEL | RETENTION_LABEL | MINUTES) {
+        if !dc.is_null() && (is_label || id == MINUTES) {
             let previous = SelectObject(dc, font);
             let mut metrics = TEXTMETRICW::default();
             if GetTextMetricsW(dc, &mut metrics) != 0 {

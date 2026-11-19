@@ -31,16 +31,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
-name = "cli-screenshot"
-version = "0.1.0"
-dependencies = [
- "embed-resource",
- "png",
- "unicode-segmentation",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "crc32fast"
 version = "1.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -239,6 +229,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "termshot"
+version = "0.1.0"
+dependencies = [
+ "embed-resource",
+ "png",
+ "unicode-segmentation",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -1,4 +1,5 @@
 use crate::capture::Image;
+use crate::{APP_NAME, LEGACY_APP_NAME};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -24,7 +25,6 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 
 const CF_UNICODETEXT: u32 = 13;
 const DELETE_RETRY_MS: u64 = 30_000;
-const PNG_SOFTWARE: &str = "CliScreenshot";
 const CAPTURE_TEMP: &str = "capture-tmp";
 const LEGACY_HEADER_BYTES: u64 = 128;
 static SEQUENCE: AtomicU32 = AtomicU32::new(0);
@@ -113,11 +113,21 @@ impl SavedCapture {
 
 impl Storage {
     pub fn open() -> io::Result<Self> {
-        let root = std::env::var_os("LOCALAPPDATA")
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA"))?
-            .join("CliScreenshot");
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA"))?;
+        Self::open_in(&local_app_data)
+    }
+
+    fn open_in(local_app_data: &Path) -> io::Result<Self> {
+        // Keep paths already copied to the clipboard valid when upgrading.
+        let legacy_root = local_app_data.join(LEGACY_APP_NAME);
+        let root = if legacy_root.try_exists()? {
+            legacy_root
+        } else {
+            local_app_data.join(APP_NAME)
+        };
         let captures = root.join("captures");
         fs::create_dir_all(&captures)?;
         Ok(Self { root, captures })
@@ -218,7 +228,7 @@ fn write_png(output: impl Write, image: &Image) -> io::Result<()> {
     encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
     encoder
-        .add_text_chunk("Software".to_owned(), PNG_SOFTWARE.to_owned())
+        .add_text_chunk("Software".to_owned(), APP_NAME.to_owned())
         .map_err(io::Error::other)?;
     let mut writer = encoder.write_header().map_err(io::Error::other)?;
     image.with_rows(|rows| {
@@ -249,9 +259,9 @@ fn is_capture(path: &Path) -> io::Result<bool> {
 }
 
 fn has_software_marker(info: &png::Info<'_>) -> bool {
-    info.uncompressed_latin1_text
-        .iter()
-        .any(|text| text.keyword == "Software" && text.text == PNG_SOFTWARE)
+    info.uncompressed_latin1_text.iter().any(|text| {
+        text.keyword == "Software" && matches!(text.text.as_str(), APP_NAME | LEGACY_APP_NAME)
+    })
 }
 
 fn is_legacy_part(path: &Path) -> io::Result<bool> {
@@ -467,6 +477,17 @@ mod tests {
         CreateWindowExW, DestroyWindow, PeekMessageW, HWND_MESSAGE, MSG, PM_REMOVE,
     };
 
+    fn write_legacy_png(path: &Path) {
+        let mut encoder = png::Encoder::new(File::create(path).unwrap(), 1, 1);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder
+            .add_text_chunk("Software".to_owned(), LEGACY_APP_NAME.to_owned())
+            .unwrap();
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[12, 34, 56]).unwrap();
+        writer.finish().unwrap();
+    }
+
     #[test]
     fn settings_require_recognized_hotkey_and_positive_retention() {
         assert_eq!(
@@ -479,21 +500,45 @@ mod tests {
     }
 
     #[test]
+    fn opens_existing_data_in_place_and_uses_the_new_name_for_fresh_data() {
+        let local_app_data =
+            std::env::temp_dir().join(format!("TermShot-data-{}-{}", std::process::id(), now_ms()));
+        let new_root = local_app_data.join(APP_NAME);
+        let legacy_root = local_app_data.join(LEGACY_APP_NAME);
+        let old_captures = legacy_root.join("captures");
+        fs::create_dir_all(&old_captures).unwrap();
+        let settings = legacy_root.join("settings.ini");
+        fs::write(&settings, "modifiers=5\nkey=82\nretention_minutes=20\n").unwrap();
+        let storage = Storage::open_in(&local_app_data).unwrap();
+        assert_eq!(storage.captures, old_captures);
+        let settings_read = storage.load_settings().unwrap();
+        assert_eq!(settings_read.hotkey.key, u32::from(b'R'));
+        assert_eq!(settings_read.retention_minutes, 20);
+        assert!(!new_root.exists());
+
+        fs::remove_file(settings).unwrap();
+        fs::remove_dir(old_captures).unwrap();
+        fs::remove_dir(legacy_root).unwrap();
+        let storage = Storage::open_in(&local_app_data).unwrap();
+        assert_eq!(storage.captures, new_root.join("captures"));
+        assert_eq!(storage.load_settings().unwrap(), Settings::default());
+        fs::remove_dir(storage.captures).unwrap();
+        fs::remove_dir(new_root).unwrap();
+        fs::remove_dir(local_app_data).unwrap();
+    }
+
+    #[test]
     fn cleanup_uses_original_time_and_only_generated_png_names() {
-        let directory = std::env::temp_dir().join(format!(
-            "CliScreenshot-test-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("TermShot-test-{}-{}", std::process::id(), now_ms()));
         fs::create_dir(&directory).unwrap();
         let expired = directory.join("shot-100000-23-0.png");
         let current = directory.join("shot-100001-23-1.png");
         let unrelated = directory.join("其他图.png");
         let unmarked = directory.join("shot-100000-23-3.png");
         let fake_capture = directory.join("shot-100000-23-2.png");
-        for path in [&expired, &current] {
-            write_png(File::create(path).unwrap(), &sample_image()).unwrap();
-        }
+        write_legacy_png(&expired);
+        write_png(File::create(&current).unwrap(), &sample_image()).unwrap();
         fs::write(&unrelated, []).unwrap();
         let mut encoder = png::Encoder::new(File::create(&unmarked).unwrap(), 1, 1);
         encoder.set_color(png::ColorType::Rgb);
@@ -520,7 +565,7 @@ mod tests {
     #[test]
     fn cleanup_expires_incomplete_temporary_files_and_marked_legacy_files() {
         let root = std::env::temp_dir().join(format!(
-            "CliScreenshot-parts-{}-{}",
+            "TermShot-parts-{}-{}",
             std::process::id(),
             now_ms()
         ));
@@ -536,7 +581,7 @@ mod tests {
         for path in [&partial, &unmarked, &recent] {
             fs::write(path, b"unfinished").unwrap();
         }
-        write_png(File::create(&legacy).unwrap(), &sample_image()).unwrap();
+        write_legacy_png(&legacy);
         let legacy_bytes = fs::read(&legacy).unwrap();
         let idat = legacy_bytes
             .windows(4)
@@ -584,6 +629,11 @@ mod tests {
         let mut reader = png::Decoder::new(BufReader::new(File::open(&path).unwrap()))
             .read_info()
             .unwrap();
+        assert!(reader
+            .info()
+            .uncompressed_latin1_text
+            .iter()
+            .any(|chunk| chunk.keyword == "Software" && chunk.text == APP_NAME));
         let mut output = vec![0; reader.output_buffer_size().unwrap()];
         let info = reader.next_frame(&mut output).unwrap();
         assert_eq!((info.width, info.height), (2, 1));
@@ -611,7 +661,7 @@ mod tests {
     #[test]
     fn background_reports_a_saved_image_and_schedules_cleanup() {
         let root = std::env::temp_dir().join(format!(
-            "CliScreenshot-background-{}-{}",
+            "TermShot-background-{}-{}",
             std::process::id(),
             now_ms()
         ));

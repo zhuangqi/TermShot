@@ -1,4 +1,5 @@
 use super::{Area, Point};
+use crate::appearance::{argb, GdiPlus};
 use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{COLORREF, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -56,23 +57,17 @@ impl LivePen {
     }
 }
 
-pub(super) struct Antialias(usize);
+pub(super) struct Antialias {
+    _gdi_plus: GdiPlus,
+}
 
 pub(super) struct Canvas(*mut GpGraphics);
 
 impl Antialias {
     pub fn new() -> Option<Self> {
-        let mut token = 0;
-        let input = GdiplusStartupInput {
-            GdiplusVersion: 1,
-            ..Default::default()
-        };
-        let result = unsafe { GdiplusStartup(&mut token, &input, null_mut()) };
-        if result == gdip::Ok {
-            Some(Self(token))
-        } else {
-            None
-        }
+        Some(Self {
+            _gdi_plus: GdiPlus::new()?,
+        })
     }
 
     pub unsafe fn draw(&self, dc: HDC, clip: Area, paint: impl FnOnce(&Canvas) -> bool) -> bool {
@@ -130,12 +125,6 @@ impl Antialias {
     }
 }
 
-impl Drop for Antialias {
-    fn drop(&mut self) {
-        unsafe { GdiplusShutdown(self.0) };
-    }
-}
-
 impl Canvas {
     pub unsafe fn lines<'a>(
         &self,
@@ -184,10 +173,6 @@ impl Canvas {
         GdipDeleteBrush(brush.cast());
         drawn
     }
-}
-
-fn argb(color: COLORREF) -> u32 {
-    0xff00_0000 | (color.swap_bytes() >> 8)
 }
 
 pub(super) unsafe fn paint(

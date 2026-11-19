@@ -1,6 +1,6 @@
 use crate::appearance::rgb;
 use crate::storage::wide;
-use crate::{register_class, WM_CAPTURE_FINISHED};
+use crate::{register_class, APP_NAME, WM_CAPTURE_FINISHED};
 use std::cell::{OnceCell, RefCell};
 use std::io;
 use std::ops::{Add, Sub};
@@ -24,7 +24,7 @@ use render::{update_rectangles, Bitmap, Font};
 use text::{TextInput, TextMark};
 use toolbar::Button;
 
-const CLASS: &str = "CliScreenshot.Overlay";
+const CLASS: &str = "TermShot.Overlay";
 const TEXT_FINISHED: u32 = WM_APP + 10;
 const CLICK_TIMER: usize = 1;
 const INK: u32 = rgb(231, 43, 52);
@@ -352,7 +352,7 @@ pub fn start(instance: HINSTANCE, owner: HWND) -> io::Result<()> {
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             wide(CLASS).as_ptr(),
-            wide("CliScreenshot 截图").as_ptr(),
+            wide(format!("{APP_NAME} 截图")).as_ptr(),
             WS_POPUP | WS_CLIPCHILDREN,
             desktop.left,
             desktop.top,
