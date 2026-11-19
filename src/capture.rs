@@ -8,7 +8,7 @@ use std::ptr::{null, null_mut};
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
-use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows_sys::Win32::UI::Controls::{HOVER_DEFAULT, WM_MOUSEHOVER, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::Input::Ime::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -300,6 +300,7 @@ struct Editor {
     toolbar: Option<Point>,
     palette_open: bool,
     hovered: Option<Button>,
+    tooltip: Option<toolbar::Tooltip>,
     pointer: Option<Point>,
     pending_click: Option<ClickAction>,
     drag: Option<Drag>,
@@ -382,6 +383,7 @@ pub fn start(instance: HINSTANCE, owner: HWND) -> io::Result<()> {
                 toolbar: None,
                 palette_open: false,
                 hovered: None,
+                tooltip: toolbar::Tooltip::new(hwnd, instance),
                 pointer: None,
                 pending_click: None,
                 drag: None,
@@ -514,7 +516,9 @@ unsafe extern "system" fn window_proc(
         WM_LBUTTONUP => edit(|editor| editor.mouse_up(editor.pointer(lparam))),
         WM_LBUTTONDBLCLK => edit(|editor| editor.finish(true)),
         WM_TIMER if wparam == CLICK_TIMER => edit(Editor::apply_pending_click),
+        WM_MOUSEHOVER => edit(|editor| editor.show_tooltip(editor.pointer(lparam))),
         WM_MOUSELEAVE => edit(|editor| {
+            editor.hide_tooltip();
             editor.pointer = None;
             editor.hovered = None;
         }),
@@ -599,6 +603,7 @@ impl Editor {
     }
 
     fn mouse_down(&mut self, point: Point) {
+        self.hide_tooltip();
         self.apply_pending_click();
         if self.finished.is_some() || self.drag.is_some() {
             return;
@@ -654,6 +659,7 @@ impl Editor {
     }
 
     fn begin_drag(&mut self, point: Point, kind: DragKind) {
+        self.hovered = None;
         self.drag = Some(Drag {
             start: point,
             end: point,
@@ -665,13 +671,7 @@ impl Editor {
 
     fn mouse_move(&mut self, point: Point) {
         if self.pointer.replace(point).is_none() {
-            let mut tracking = TRACKMOUSEEVENT {
-                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                dwFlags: TME_LEAVE,
-                hwndTrack: self.hwnd,
-                dwHoverTime: 0,
-            };
-            unsafe { TrackMouseEvent(&mut tracking) };
+            self.track_mouse(TME_LEAVE);
         }
         if let Some(drag) = self.drag.as_mut() {
             drag.update(point, self.selection);
@@ -680,9 +680,50 @@ impl Editor {
                 self.toolbar = Some(self.clamp_toolbar(position, point));
             }
         } else {
-            self.hovered = self.toolbar_layout().and_then(|layout| layout.hit(point));
+            let hovered = self.toolbar_layout().and_then(|layout| layout.hit(point));
+            if hovered != self.hovered {
+                self.hide_tooltip();
+                self.hovered = hovered;
+                if hovered.and_then(Button::tooltip_text).is_some() {
+                    self.track_mouse(TME_HOVER);
+                }
+            }
         }
         self.set_cursor(Some(point));
+    }
+
+    fn track_mouse(&self, flags: TRACKMOUSEEVENT_FLAGS) {
+        let mut tracking = TRACKMOUSEEVENT {
+            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: flags,
+            hwndTrack: self.hwnd,
+            dwHoverTime: HOVER_DEFAULT,
+        };
+        unsafe { TrackMouseEvent(&mut tracking) };
+    }
+
+    fn show_tooltip(&mut self, point: Point) {
+        let Some(layout) = self.toolbar_layout().filter(|_| self.drag.is_none()) else {
+            return;
+        };
+        let Some(button) = layout
+            .hit(point)
+            .filter(|button| self.hovered == Some(*button))
+        else {
+            return;
+        };
+        if let Some(tooltip) = &mut self.tooltip {
+            tooltip.show(layout, button, self.desktop.origin());
+        }
+    }
+
+    fn hide_tooltip(&mut self) {
+        if self.hovered.and_then(Button::tooltip_text).is_some() {
+            self.track_mouse(TME_CANCEL | TME_HOVER);
+            if let Some(tooltip) = &self.tooltip {
+                tooltip.hide();
+            }
+        }
     }
 
     fn mark_at(&self, point: Point) -> Option<usize> {
@@ -822,10 +863,7 @@ impl Editor {
     }
 
     fn add_mark(&mut self, mark: Mark) {
-        let index = self.marks.len();
-        self.change(Change::Insert(index, mark));
-        self.tool = Tool::Select;
-        self.selected_mark = Some(index);
+        self.change(Change::Insert(self.marks.len(), mark));
     }
 
     fn change(&mut self, change: Change) {
@@ -985,6 +1023,7 @@ impl Editor {
             }
         }
         self.take_pending_click();
+        self.hide_tooltip();
         self.finished = Some(save);
         unsafe { PostMessageW(self.owner, WM_CAPTURE_FINISHED, 0, 0) };
     }
@@ -1128,6 +1167,7 @@ mod tests {
             toolbar: None,
             palette_open: false,
             hovered: None,
+            tooltip: None,
             pointer: None,
             pending_click: None,
             drag: None,
@@ -1170,7 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn drawn_shapes_auto_select_and_support_moving_and_resizing() {
+    fn drawing_keeps_the_tool_active_and_shapes_can_be_selected_and_edited() {
         let mut editor = editor_with_selection();
         let start = Point { x: 30, y: 42 };
         let end = Point { x: 72, y: 75 };
@@ -1178,7 +1218,16 @@ mod tests {
         editor.mouse_down(start);
         editor.mouse_up(end);
         let original = editor.marks[0].bounds();
-        assert_eq!(editor.tool, Tool::Select);
+        assert_eq!(editor.tool, Tool::Rectangle);
+        editor.mouse_down(Point { x: 95, y: 45 });
+        editor.mouse_up(Point { x: 120, y: 75 });
+        assert_eq!(editor.marks.len(), 2);
+        assert_eq!(editor.selected_mark, None);
+
+        editor.perform_click(ClickAction::Button(Button::Tool(Tool::Select)));
+        let center = Point { x: 55, y: 58 };
+        editor.mouse_down(center);
+        editor.mouse_up(center);
         assert_eq!(editor.selected_mark, Some(0));
 
         let east = Point { x: 72, y: 58 };
@@ -1188,7 +1237,6 @@ mod tests {
         let resized = editor.marks[0].bounds();
         assert_eq!(resized.width(), original.width() + 12);
         assert_eq!(resized.height(), original.height());
-        let center = Point { x: 55, y: 58 };
         let delta = Point { x: 7, y: 9 };
         editor.mouse_down(center);
         editor.mouse_up(center + delta);
@@ -1202,7 +1250,10 @@ mod tests {
         editor.tool = Tool::Arrow;
         editor.mouse_down(start);
         editor.mouse_up(end);
-        assert_eq!(editor.tool, Tool::Select);
+        assert_eq!(editor.tool, Tool::Arrow);
+        editor.perform_click(ClickAction::Button(Button::Tool(Tool::Select)));
+        editor.mouse_down(start);
+        editor.mouse_up(start);
         editor.mouse_down(end);
         editor.mouse_up(end + Point { x: 10, y: -12 });
         let changed = editor.marks[0].bounds();
@@ -1216,9 +1267,13 @@ mod tests {
         let mut editor = editor_with_selection();
         editor.tool = Tool::Pen;
         editor.mouse_down(start);
-        editor.mouse_move(Point { x: 50, y: 53 });
+        let bend = Point { x: 50, y: 53 };
+        editor.mouse_move(bend);
         editor.mouse_up(end);
-        assert_eq!(editor.tool, Tool::Select);
+        assert_eq!(editor.tool, Tool::Pen);
+        editor.perform_click(ClickAction::Button(Button::Tool(Tool::Select)));
+        editor.mouse_down(bend);
+        editor.mouse_up(bend);
         let original = editor.marks[0].bounds();
         let south = Point { x: 51, y: 75 };
         assert_eq!(editor.cursor_at(Some(south)), IDC_SIZENS);
@@ -1407,6 +1462,7 @@ mod tests {
             editor.mouse_move(drawing_end);
             if transform {
                 editor.mouse_up(drawing_end);
+                editor.perform_click(ClickAction::Button(Button::Tool(Tool::Select)));
                 editor.mouse_down(move_start);
                 editor.mouse_move(move_end);
             }
@@ -1642,20 +1698,20 @@ mod tests {
             assert_eq!(editor.finished, None);
             editor.selection = selection;
         });
-        let check_saved = |mark_count| {
+        let check_saved = |mark_count, tool| {
             EDITOR.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 let editor = slot.as_mut().unwrap();
                 assert_eq!(editor.finished.take(), Some(true));
                 assert_eq!(editor.marks.len(), mark_count);
-                assert_eq!(editor.tool, Tool::Select);
+                assert_eq!(editor.tool, tool);
             });
         };
         for point in [outside, Point { x: 31, y: 35 }, cancel, undo] {
             send_mouse(WM_LBUTTONDOWN, point);
             send_mouse(WM_LBUTTONUP, point);
             send_mouse(WM_LBUTTONDBLCLK, point);
-            check_saved(1);
+            check_saved(1, Tool::Rectangle);
         }
 
         let mut edit = null_mut();
@@ -1698,7 +1754,7 @@ mod tests {
         send_mouse(WM_LBUTTONDOWN, draft_point);
         send_mouse(WM_LBUTTONUP, draft_point);
         send_mouse(WM_LBUTTONDBLCLK, draft_point);
-        check_saved(2);
+        check_saved(2, Tool::Text);
 
         with_editor(|editor| {
             editor.tool = Tool::Text;
@@ -1722,7 +1778,13 @@ mod tests {
         with_editor(|editor| {
             assert!(editor.text.is_none());
             assert_eq!(editor.marks.len(), 3);
+            assert_eq!(editor.tool, Tool::Text);
         });
+
+        let next_anchor = Point { x: 30, y: 35 };
+        send_mouse(WM_LBUTTONDOWN, next_anchor);
+        with_editor(|editor| assert!(editor.text.is_some()));
+        unsafe { SendMessageW(hwnd, TEXT_FINISHED, 0, 0) };
 
         send_mouse(WM_LBUTTONDOWN, cancel);
         send_mouse(WM_LBUTTONUP, cancel);

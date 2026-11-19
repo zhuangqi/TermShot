@@ -3,8 +3,15 @@ use crate::appearance::{
     fill, primary_fill, rgb, round, selected_fill, ACCENT, ACCENT_TEXT, BORDER, CONTROL_BORDER,
     CONTROL_CORNER, HOVER, MUTED, PANEL, PANEL_CORNER, SELECTED_BORDER, SELECTED_TEXT, TEXT,
 };
-use windows_sys::Win32::Foundation::{COLORREF, POINT};
+use std::ptr::{null, null_mut};
+use windows_sys::core::{w, PCWSTR};
+use windows_sys::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, POINT};
 use windows_sys::Win32::Graphics::Gdi::*;
+use windows_sys::Win32::UI::Controls::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, SendMessageW, CW_USEDEFAULT, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
+    WS_POPUP,
+};
 
 const PADDING: i32 = 6;
 const GAP: i32 = 3;
@@ -14,6 +21,7 @@ const ICON_SIZE: i32 = 22;
 const ICON_LINE_WIDTH: f32 = 2.5;
 const PALETTE_SIZE: i32 = 34;
 const PALETTE_HEIGHT: i32 = PALETTE_SIZE + PADDING * 2;
+const POPOVER_GAP: i32 = 6;
 pub(super) const HEIGHT: i32 = BUTTON_SIZE + PADDING * 2;
 pub(super) const WIDTH: i32 = 2 * PADDING
     + GAP * (BUTTONS.len() as i32 - 1)
@@ -40,6 +48,26 @@ pub(super) enum Button {
     Redo,
     Cancel,
     Save,
+}
+
+impl Button {
+    pub fn tooltip_text(self) -> Option<PCWSTR> {
+        Some(match self {
+            Self::Grip => w!("拖动工具栏"),
+            Self::Tool(Tool::Select) => w!("选择标注"),
+            Self::Tool(Tool::Rectangle) => w!("画矩形"),
+            Self::Tool(Tool::Arrow) => w!("画箭头"),
+            Self::Tool(Tool::Pen) => w!("画笔"),
+            Self::Tool(Tool::Text) => w!("添加文字"),
+            Self::Tool(Tool::Eraser) => w!("擦除标注"),
+            Self::Palette => w!("选择颜色"),
+            Self::Undo => w!("撤销"),
+            Self::Redo => w!("重做"),
+            Self::Cancel => w!("取消截图"),
+            Self::Save => w!("保存截图"),
+            Self::Swatch(_) => return None,
+        })
+    }
 }
 
 const BUTTONS: [Button; 12] = [
@@ -71,6 +99,87 @@ pub(super) struct State {
     pub color: COLORREF,
     pub can_undo: bool,
     pub can_redo: bool,
+}
+
+pub(super) struct Tooltip {
+    hwnd: HWND,
+    tool: TTTOOLINFOW,
+}
+
+impl Tooltip {
+    pub fn new(overlay: HWND, instance: HINSTANCE) -> Option<Self> {
+        unsafe {
+            if InitCommonControlsEx(&INITCOMMONCONTROLSEX {
+                dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_BAR_CLASSES,
+            }) == 0
+            {
+                return None;
+            }
+            // The overlay owns the popup and Windows destroys it with the overlay.
+            let hwnd = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                TOOLTIPS_CLASSW,
+                null(),
+                WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                overlay,
+                null_mut(),
+                instance,
+                null(),
+            );
+            if hwnd.is_null() {
+                return None;
+            }
+            let tool = TTTOOLINFOW {
+                cbSize: size_of::<TTTOOLINFOW>() as u32,
+                uFlags: TTF_TRACK | TTF_ABSOLUTE | TTF_TRANSPARENT,
+                hwnd: overlay,
+                uId: 1,
+                lpszText: w!("").cast_mut(),
+                ..Default::default()
+            };
+            if SendMessageW(hwnd, TTM_ADDTOOLW, 0, &tool as *const _ as LPARAM) == 0 {
+                DestroyWindow(hwnd);
+                return None;
+            }
+            Some(Self { hwnd, tool })
+        }
+    }
+
+    pub fn show(&mut self, layout: Layout, button: Button, desktop_origin: Point) {
+        let Some(text) = button.tooltip_text() else {
+            return;
+        };
+        self.tool.lpszText = text.cast_mut();
+        let tool = &self.tool as *const _ as LPARAM;
+        unsafe {
+            SendMessageW(self.hwnd, TTM_UPDATETIPTEXTW, 0, tool);
+            let size = SendMessageW(self.hwnd, TTM_GETBUBBLESIZE, 0, tool) as u32;
+            let width = i32::from(size as u16);
+            let height = i32::from((size >> 16) as u16);
+            if let Some(point) = layout.tooltip_origin(button, width, height) {
+                let screen = point + desktop_origin;
+                let position = u32::from(screen.x as u16) | (u32::from(screen.y as u16) << 16);
+                SendMessageW(self.hwnd, TTM_TRACKPOSITION, 0, position as LPARAM);
+                SendMessageW(self.hwnd, TTM_TRACKACTIVATE, 1, tool);
+            }
+        }
+    }
+
+    pub fn hide(&self) {
+        unsafe {
+            SendMessageW(
+                self.hwnd,
+                TTM_TRACKACTIVATE,
+                0,
+                &self.tool as *const _ as LPARAM,
+            )
+        };
+    }
 }
 
 enum Glyph {
@@ -115,11 +224,11 @@ impl Layout {
             self.monitor.left,
             (self.monitor.right - width).max(self.monitor.left),
         );
-        let top = self.origin.y - PALETTE_HEIGHT - 6;
+        let top = self.origin.y - PALETTE_HEIGHT - POPOVER_GAP;
         let y = if top >= self.monitor.top {
             top
         } else {
-            self.origin.y + HEIGHT + 6
+            self.origin.y + HEIGHT + POPOVER_GAP
         };
         Some(area_at(Point { x, y }, width, PALETTE_HEIGHT))
     }
@@ -144,6 +253,34 @@ impl Layout {
             .chain(self.buttons())
             .find(|(_, area)| area.contains(point))
             .map(|(button, _)| button)
+    }
+
+    fn tooltip_origin(&self, button: Button, width: i32, height: i32) -> Option<Point> {
+        let (_, anchor) = self.buttons().find(|(candidate, _)| *candidate == button)?;
+        let x = (anchor.left + (anchor.width() - width) / 2).clamp(
+            self.monitor.left,
+            (self.monitor.right - width).max(self.monitor.left),
+        );
+        let panel = self.panel();
+        let palette = self.palette();
+        let below = |area: Area| area.bottom + POPOVER_GAP;
+        let above = |area: Area| area.top - POPOVER_GAP - height;
+        [
+            Some(below(panel)),
+            palette.map(below),
+            Some(above(panel)),
+            palette.map(above),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|y| area_at(Point { x, y }, width, height))
+        .find(|bounds| {
+            self.monitor.intersection(*bounds) == Some(*bounds)
+                && bounds.intersection(panel.padded(POPOVER_GAP)).is_none()
+                && palette
+                    .is_none_or(|area| bounds.intersection(area.padded(POPOVER_GAP)).is_none())
+        })
+        .map(Area::origin)
     }
 
     pub fn contains(&self, point: Point) -> bool {
@@ -389,6 +526,53 @@ fn icon_paths(button: Button) -> &'static [IconPath] {
 mod tests {
     use super::*;
     use crate::capture::Bitmap;
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsWindow, IsWindowVisible};
+
+    #[test]
+    fn native_tooltip_opens_below_the_button_with_room_and_hides() {
+        let instance = unsafe { GetModuleHandleW(null()) };
+        let overlay = unsafe {
+            CreateWindowExW(
+                0,
+                w!("STATIC"),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                WIDTH + 40,
+                HEIGHT + 100,
+                null_mut(),
+                null_mut(),
+                instance,
+                null(),
+            )
+        };
+        assert!(!overlay.is_null());
+        let mut tooltip = Tooltip::new(overlay, instance).unwrap();
+        let layout = Layout {
+            origin: Point { x: 12, y: 10 },
+            monitor: area_at(Point { x: 0, y: 0 }, WIDTH + 40, HEIGHT + 100),
+            palette_open: false,
+        };
+        let button = Button::Tool(Tool::Rectangle);
+        tooltip.show(layout, button, Point { x: 0, y: 0 });
+        unsafe {
+            let visible = IsWindowVisible(tooltip.hwnd);
+            let mut rect = RECT::default();
+            let positioned = GetWindowRect(tooltip.hwnd, &mut rect);
+            tooltip.hide();
+            let hidden = IsWindowVisible(tooltip.hwnd) == 0;
+            DestroyWindow(overlay);
+            assert_ne!(visible, 0);
+            assert_ne!(positioned, 0);
+            assert_eq!(rect.top, layout.panel().bottom + POPOVER_GAP);
+            assert!(rect.bottom > rect.top);
+            assert!(hidden);
+            assert_eq!(IsWindow(tooltip.hwnd), 0);
+        }
+    }
 
     #[test]
     fn toolbar_icons_blend_edges_into_panel() {
