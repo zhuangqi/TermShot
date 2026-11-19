@@ -1,7 +1,7 @@
-use crate::appearance::{self, rgb};
+use crate::appearance::rgb;
 use crate::storage::wide;
 use crate::{register_class, WM_CAPTURE_FINISHED};
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::io;
 use std::ops::{Add, Sub};
 use std::ptr::{null, null_mut};
@@ -14,11 +14,13 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 mod annotations;
+mod render;
 mod strokes;
 mod text;
 mod toolbar;
 mod windows;
 use annotations::{Change, Handle, Mark, Tool};
+use render::{update_rectangles, Bitmap, Font};
 use text::{TextInput, TextMark};
 use toolbar::Button;
 
@@ -26,12 +28,12 @@ const CLASS: &str = "CliScreenshot.Overlay";
 const TEXT_FINISHED: u32 = WM_APP + 10;
 const CLICK_TIMER: usize = 1;
 const INK: u32 = rgb(231, 43, 52);
-const ANNOTATION_FONT_HEIGHT: i32 = 24;
 
 thread_local! {
     static EDITOR: RefCell<Option<Editor>> = const { RefCell::new(None) };
 }
 
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Point {
     x: i32,
@@ -102,6 +104,82 @@ impl Area {
         (area.width() > 0 && area.height() > 0).then_some(area)
     }
 
+    fn outside(self, other: Option<Self>) -> impl Iterator<Item = Self> {
+        let pieces = if let Some(overlap) = other.and_then(|other| self.intersection(other)) {
+            [
+                Some(Self {
+                    bottom: overlap.top,
+                    ..self
+                }),
+                Some(Self {
+                    top: overlap.bottom,
+                    ..self
+                }),
+                Some(Self {
+                    top: overlap.top,
+                    bottom: overlap.bottom,
+                    right: overlap.left,
+                    ..self
+                }),
+                Some(Self {
+                    top: overlap.top,
+                    bottom: overlap.bottom,
+                    left: overlap.right,
+                    ..self
+                }),
+            ]
+        } else {
+            [Some(self), None, None, None]
+        };
+        pieces
+            .into_iter()
+            .flatten()
+            .filter(|piece| piece.width() > 0 && piece.height() > 0)
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            left: self.left.min(other.left),
+            top: self.top.min(other.top),
+            right: self.right.max(other.right),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+
+    fn pixel(point: Point) -> Self {
+        Self {
+            left: point.x,
+            top: point.y,
+            right: point.x + 1,
+            bottom: point.y + 1,
+        }
+    }
+
+    fn padded(self, margin: i32) -> Self {
+        Self {
+            left: self.left - margin,
+            top: self.top - margin,
+            right: self.right + margin,
+            bottom: self.bottom + margin,
+        }
+    }
+
+    fn origin(self) -> Point {
+        Point {
+            x: self.left,
+            y: self.top,
+        }
+    }
+
+    fn from_rect(rect: RECT) -> Self {
+        Self {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+        }
+    }
+
     fn offset(self, point: Point) -> Self {
         Self {
             left: self.left + point.x,
@@ -141,10 +219,8 @@ enum DragKind {
     Region {
         box_started: bool,
     },
-    Draw {
-        tool: Tool,
-        points: Vec<Point>,
-    },
+    Draw(Tool),
+    Pen(strokes::LivePen),
     Mark {
         index: usize,
         handle: Option<Handle>,
@@ -170,15 +246,9 @@ impl Drag {
                         || (end.y - self.start.y).abs() >= GetSystemMetrics(SM_CYDRAG).max(1)
                 };
             }
-            DragKind::Draw {
-                tool: Tool::Pen,
-                points,
-            } => {
+            DragKind::Pen(stroke) => {
                 if let Some(crop) = crop {
-                    let point = crop.local(end);
-                    if points.last() != Some(&point) {
-                        points.push(point);
-                    }
+                    stroke.push(crop.local(end));
                 }
             }
             _ => {}
@@ -190,7 +260,7 @@ impl Drag {
     }
 
     fn drawn_mark(&self, crop: Area, color: COLORREF) -> Option<Mark> {
-        let DragKind::Draw { tool, points } = &self.kind else {
+        let DragKind::Draw(tool) = self.kind else {
             return None;
         };
         let start = crop.local(self.start);
@@ -198,9 +268,15 @@ impl Drag {
         match tool {
             Tool::Rectangle => Area::from_drag(start, end).map(|area| Mark::rectangle(area, color)),
             Tool::Arrow if start != end => Some(Mark::arrow(start, end, color)),
-            Tool::Pen if points.len() > 1 => Some(Mark::pen(points.clone(), color)),
             _ => None,
         }
+    }
+
+    fn paint_bounds(&self, crop: Area, color: COLORREF) -> Option<Area> {
+        if let DragKind::Pen(stroke) = &self.kind {
+            return stroke.paint_bounds();
+        }
+        self.drawn_mark(crop, color).map(|mark| mark.paint_bounds())
     }
 }
 
@@ -217,10 +293,9 @@ struct Editor {
     monitors: Vec<Area>,
     windows: Vec<Area>,
     original: Bitmap,
-    shaded: Bitmap,
-    frame: Bitmap,
-    font: Font,
-    antialias: Option<strokes::Antialias>,
+    frame: Option<Bitmap>,
+    font: Option<Font>,
+    antialias: OnceCell<Option<strokes::Antialias>>,
     selection: Option<Area>,
     toolbar: Option<Point>,
     palette_open: bool,
@@ -236,13 +311,10 @@ struct Editor {
     redo: Vec<Change>,
     text: Option<TextInput>,
     finished: Option<bool>,
+    save_busy: bool,
 }
 
-pub struct Image {
-    pub width: u32,
-    pub height: u32,
-    pub rgb: Vec<u8>,
-}
+pub use render::Image;
 
 pub fn register(instance: HINSTANCE) -> io::Result<()> {
     register_class(instance, CLASS, Some(window_proc), IDC_CROSS, null_mut())
@@ -276,18 +348,7 @@ pub fn start(instance: HINSTANCE, owner: HWND) -> io::Result<()> {
             .ok_or_else(|| io::Error::other("没有可用的显示器"))?;
         let windows = windows::visible_bounds(desktop);
         let original = Bitmap::capture(desktop, &monitors)?;
-        let mut shaded = Bitmap::new(desktop.width(), desktop.height())?;
-        let frame = Bitmap::new(desktop.width(), desktop.height())?;
-        for (target, source) in shaded
-            .bytes_mut()
-            .chunks_exact_mut(4)
-            .zip(original.bytes().chunks_exact(4))
-        {
-            for channel in 0..3 {
-                target[channel] = (u16::from(source[channel]) * 43 / 100) as u8;
-            }
-        }
-        let font = Font::new(frame.dc)?;
+        let frame = Bitmap::preview(desktop)?;
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             wide(CLASS).as_ptr(),
@@ -314,10 +375,9 @@ pub fn start(instance: HINSTANCE, owner: HWND) -> io::Result<()> {
                 monitors,
                 windows,
                 original,
-                shaded,
-                frame,
-                font,
-                antialias: strokes::Antialias::new(),
+                frame: Some(frame),
+                font: None,
+                antialias: OnceCell::new(),
                 selection: None,
                 toolbar: None,
                 palette_open: false,
@@ -333,6 +393,7 @@ pub fn start(instance: HINSTANCE, owner: HWND) -> io::Result<()> {
                 redo: Vec::new(),
                 text: None,
                 finished: None,
+                save_busy: false,
             }))
         });
         SetWindowPos(
@@ -347,7 +408,7 @@ pub fn start(instance: HINSTANCE, owner: HWND) -> io::Result<()> {
         SetForegroundWindow(hwnd);
         SetFocus(hwnd);
         if let Some(point) = windows::pointer(hwnd) {
-            with_editor(|editor| editor.mouse_move(point));
+            edit(|editor| editor.mouse_move(point));
         }
         UpdateWindow(hwnd);
         Ok(())
@@ -373,11 +434,18 @@ unsafe extern "system" fn collect_monitor(
     1
 }
 
-pub fn complete() -> io::Result<Option<Image>> {
-    let Some(editor) = EDITOR.with(|slot| slot.take()) else {
+pub fn complete(save_budget: usize) -> io::Result<Option<Image>> {
+    let Some(mut editor) = EDITOR.with(|slot| slot.take()) else {
         return Ok(None);
     };
     let save = editor.finished == Some(true);
+    if save && editor.exceeds_save_budget(save_budget) {
+        editor.finished = None;
+        editor.save_busy = true;
+        unsafe { InvalidateRect(editor.hwnd, null(), 0) };
+        EDITOR.with(|slot| slot.replace(Some(editor)));
+        return Ok(None);
+    }
     unsafe {
         let was_foreground = GetForegroundWindow() == editor.hwnd;
         DestroyWindow(editor.hwnd);
@@ -386,7 +454,7 @@ pub fn complete() -> io::Result<Option<Image>> {
         }
     }
     if save {
-        editor.export().map(Some)
+        editor.export(save_budget).map(Some)
     } else {
         Ok(None)
     }
@@ -429,34 +497,35 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if message == WM_PAINT {
+        let regions = update_rectangles(hwnd);
         let mut paint = PAINTSTRUCT::default();
         let dc = BeginPaint(hwnd, &mut paint);
-        with_editor(|editor| editor.paint(dc));
+        let regions = regions
+            .as_deref()
+            .unwrap_or(std::slice::from_ref(&paint.rcPaint));
+        with_editor(|editor| editor.paint(dc, regions));
         EndPaint(hwnd, &paint);
         return 0;
     }
     match message {
         WM_ERASEBKGND => return 1,
-        WM_LBUTTONDOWN => with_editor(|editor| editor.mouse_down(editor.pointer(lparam))),
-        WM_MOUSEMOVE => with_editor(|editor| editor.mouse_move(editor.pointer(lparam))),
-        WM_LBUTTONUP => with_editor(|editor| editor.mouse_up(editor.pointer(lparam))),
-        WM_LBUTTONDBLCLK => with_editor(|editor| editor.finish(true)),
-        WM_TIMER if wparam == CLICK_TIMER => with_editor(Editor::apply_pending_click),
-        WM_MOUSELEAVE => with_editor(|editor| {
+        WM_LBUTTONDOWN => edit(|editor| editor.mouse_down(editor.pointer(lparam))),
+        WM_MOUSEMOVE => edit(|editor| editor.mouse_move(editor.pointer(lparam))),
+        WM_LBUTTONUP => edit(|editor| editor.mouse_up(editor.pointer(lparam))),
+        WM_LBUTTONDBLCLK => edit(|editor| editor.finish(true)),
+        WM_TIMER if wparam == CLICK_TIMER => edit(Editor::apply_pending_click),
+        WM_MOUSELEAVE => edit(|editor| {
             editor.pointer = None;
             editor.hovered = None;
-            editor.repaint();
         }),
         WM_SETCURSOR if wparam as HWND == hwnd => {
             with_editor(|editor| editor.set_cursor(windows::pointer(hwnd)));
             return 1;
         }
-        WM_CAPTURECHANGED => with_editor(|editor| {
-            if editor.drag.take().is_some() {
-                InvalidateRect(hwnd, null(), 0);
-            }
+        WM_CAPTURECHANGED => edit(|editor| {
+            editor.drag = None;
         }),
-        WM_KEYDOWN => with_editor(|editor| editor.key_down(wparam as u16)),
+        WM_KEYDOWN => edit(|editor| editor.key_down(wparam as u16)),
         WM_IME_SETCONTEXT => {
             return DefWindowProcW(
                 hwnd,
@@ -465,12 +534,16 @@ unsafe extern "system" fn window_proc(
                 lparam & !(ISC_SHOWUICOMPOSITIONWINDOW as isize),
             );
         }
-        TEXT_FINISHED => with_editor(|editor| editor.close_text(wparam != 0)),
-        text::UPDATED => with_editor(|editor| {
-            if let (Some(input), Some(crop)) = (&mut editor.text, editor.selection) {
+        TEXT_FINISHED => edit(|editor| {
+            editor.close_text(wparam != 0);
+        }),
+        text::UPDATED => edit(|editor| {
+            if let (Some(input), Some(crop), Some(font)) =
+                (&mut editor.text, editor.selection, editor.font.as_ref())
+            {
                 if input.hwnd == wparam as HWND {
-                    input.refresh(hwnd, editor.frame.dc, &editor.font, crop);
-                    editor.repaint();
+                    input.refresh(hwnd, editor.original.dc, font, crop);
+                    editor.invalidate_draft();
                 }
             }
         }),
@@ -490,10 +563,8 @@ unsafe extern "system" fn window_proc(
             });
             return LRESULT::from(handled);
         }
-        WM_DISPLAYCHANGE | WM_CLOSE => with_editor(|editor| editor.finish(false)),
-        WM_ACTIVATE if wparam as u16 == WA_INACTIVE as u16 => {
-            with_editor(|editor| editor.finish(false))
-        }
+        WM_DISPLAYCHANGE | WM_CLOSE => edit(|editor| editor.finish(false)),
+        WM_ACTIVATE if wparam as u16 == WA_INACTIVE as u16 => edit(|editor| editor.finish(false)),
         _ => return DefWindowProcW(hwnd, message, wparam, lparam),
     }
     0
@@ -505,6 +576,16 @@ fn with_editor(action: impl FnOnce(&mut Editor)) {
             if let Some(editor) = slot.as_mut().filter(|editor| editor.finished.is_none()) {
                 action(editor);
             }
+        }
+    });
+}
+
+fn edit(action: impl FnOnce(&mut Editor)) {
+    with_editor(|editor| {
+        let before = editor.preview();
+        action(editor);
+        if editor.finished.is_none() {
+            editor.invalidate_changes(before);
         }
     });
 }
@@ -535,9 +616,7 @@ impl Editor {
                 return;
             }
         }
-        if std::mem::take(&mut self.palette_open) {
-            self.repaint();
-        }
+        self.palette_open = false;
         if !crop.contains(point) {
             self.close_text(true);
             return;
@@ -548,7 +627,9 @@ impl Editor {
                 input.set_caret(local);
                 return;
             }
-            self.close_text(true);
+            if !self.close_text(true) {
+                return;
+            }
         }
 
         match self.tool {
@@ -560,7 +641,6 @@ impl Editor {
                 if let Some(index) = self.selected_mark {
                     self.begin_drag(point, DragKind::Mark { index, handle });
                 }
-                self.repaint();
             }
             Tool::Eraser => {
                 if let Some(index) = self.mark_at(local) {
@@ -568,17 +648,8 @@ impl Editor {
                 }
             }
             Tool::Text => self.open_text(crop, local),
-            tool => self.begin_drag(
-                point,
-                DragKind::Draw {
-                    tool,
-                    points: if tool == Tool::Pen {
-                        vec![local]
-                    } else {
-                        Vec::new()
-                    },
-                },
-            ),
+            Tool::Pen => self.begin_drag(point, DragKind::Pen(strokes::LivePen::new(local))),
+            tool => self.begin_drag(point, DragKind::Draw(tool)),
         }
     }
 
@@ -593,7 +664,6 @@ impl Editor {
     }
 
     fn mouse_move(&mut self, point: Point) {
-        let old_window = self.pointer.and_then(|old| self.window_at(old));
         if self.pointer.replace(point).is_none() {
             let mut tracking = TRACKMOUSEEVENT {
                 cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
@@ -609,13 +679,8 @@ impl Editor {
                 let position = origin + drag.delta();
                 self.toolbar = Some(self.clamp_toolbar(position, point));
             }
-            self.repaint();
         } else {
-            let hovered = self.toolbar_layout().and_then(|layout| layout.hit(point));
-            if self.hovered != hovered || old_window != self.window_at(point) {
-                self.hovered = hovered;
-                self.repaint();
-            }
+            self.hovered = self.toolbar_layout().and_then(|layout| layout.hit(point));
         }
         self.set_cursor(Some(point));
     }
@@ -715,18 +780,33 @@ impl Editor {
     }
 
     fn mouse_up(&mut self, point: Point) {
-        let Some(mut drag) = self.drag.take() else {
+        let Some(drag) = self.drag.as_mut() else {
             return;
         };
         drag.update(point, self.selection);
+        self.commit_drag();
+        self.mouse_move(point);
+    }
+
+    fn commit_drag(&mut self) {
+        let Some(drag) = self.drag.take() else {
+            return;
+        };
         unsafe { ReleaseCapture() };
         match drag.kind {
             DragKind::Region { .. } => {
                 self.selection = self.selection_for_drag(&drag);
-                self.toolbar = self.selection.map(|crop| self.toolbar_origin(crop, point));
+                self.toolbar = self
+                    .selection
+                    .map(|crop| self.toolbar_origin(crop, drag.end));
             }
             DragKind::Toolbar { origin } => {
-                self.toolbar = Some(self.clamp_toolbar(origin + drag.delta(), point));
+                self.toolbar = Some(self.clamp_toolbar(origin + drag.delta(), drag.end));
+            }
+            DragKind::Pen(stroke) => {
+                if stroke.points.len() > 1 {
+                    self.add_mark(Mark::pen(stroke.points, self.color));
+                }
             }
             _ => {
                 if let Some(crop) = self.selection {
@@ -739,8 +819,6 @@ impl Editor {
                 }
             }
         }
-        self.mouse_move(point);
-        self.repaint();
     }
 
     fn add_mark(&mut self, mark: Mark) {
@@ -751,7 +829,8 @@ impl Editor {
     }
 
     fn change(&mut self, change: Change) {
-        self.undo.push(change.apply(&mut self.marks));
+        let inverse = self.apply_change(change);
+        self.undo.push(inverse);
         self.redo.clear();
     }
 
@@ -763,14 +842,32 @@ impl Editor {
 
     fn history(&mut self, redo: bool) {
         self.discard_drag();
-        let (from, to) = if redo {
-            (&mut self.redo, &mut self.undo)
+        let change = if redo {
+            self.redo.pop()
         } else {
-            (&mut self.undo, &mut self.redo)
+            self.undo.pop()
         };
-        if let Some(change) = from.pop() {
-            to.push(change.apply(&mut self.marks));
+        if let Some(change) = change {
+            let inverse = self.apply_change(change);
+            if redo {
+                self.undo.push(inverse);
+            } else {
+                self.redo.push(inverse);
+            }
             self.selected_mark = None;
+        }
+    }
+
+    fn apply_change(&mut self, change: Change) -> Change {
+        let (inverse, before, after) = change.apply(&mut self.marks);
+        self.invalidate_marks(before, after);
+        inverse
+    }
+
+    fn invalidate_marks(&self, before: Option<Area>, after: Option<Area>) {
+        if let Some(crop) = self.selection {
+            self.invalidate(before.and_then(|area| area.offset(crop.origin()).intersection(crop)));
+            self.invalidate(after.and_then(|area| area.offset(crop.origin()).intersection(crop)));
         }
     }
 
@@ -802,12 +899,16 @@ impl Editor {
             _ => return,
         }
         self.set_cursor(self.pointer);
-        self.repaint();
     }
 
     fn toolbar_click(&mut self, button: Button, point: Point) {
-        if !matches!(button, Button::Palette | Button::Swatch(_)) {
-            self.close_text(true);
+        if !matches!(
+            button,
+            Button::Palette | Button::Swatch(_) | Button::Cancel | Button::Save
+        ) {
+            if !self.close_text(true) {
+                return;
+            }
             self.palette_open = false;
         }
         if button == Button::Grip {
@@ -850,7 +951,6 @@ impl Editor {
                 Button::Grip => {}
             },
         }
-        self.repaint();
     }
 
     fn defer_click(&mut self, action: ClickAction) {
@@ -876,10 +976,13 @@ impl Editor {
 
     fn finish(&mut self, save: bool) {
         if save {
+            if !self.close_text(true) {
+                return;
+            }
+            self.commit_drag();
             if self.selection.is_none() {
                 return;
             }
-            self.close_text(true);
         }
         self.take_pending_click();
         self.finished = Some(save);
@@ -887,29 +990,42 @@ impl Editor {
     }
 
     fn open_text(&mut self, crop: Area, anchor: Point) {
-        self.text = TextInput::new(self.hwnd, self.frame.dc, &self.font, crop, anchor);
+        if self.font.is_none() {
+            self.font = Font::new(self.original.dc).ok();
+        }
+        let Some(font) = self.font.as_ref() else {
+            return;
+        };
+        self.text = TextInput::new(self.hwnd, self.original.dc, font, crop, anchor);
         if let Some(input) = self.text.as_mut() {
             unsafe { SetFocus(input.hwnd) };
-            input.refresh(self.hwnd, self.frame.dc, &self.font, crop);
-            self.repaint();
+            input.refresh(self.hwnd, self.original.dc, font, crop);
         }
     }
 
-    fn close_text(&mut self, keep: bool) {
-        let Some(input) = self.text.take() else {
-            return;
+    fn close_text(&mut self, keep: bool) -> bool {
+        let Some(input) = &mut self.text else {
+            return true;
         };
-        if let Some(crop) = self.selection.filter(|_| keep) {
-            if let Some(mark) = input.finish(self.frame.dc, &self.font, crop) {
-                self.add_mark(Mark::text(mark, crop.local_bounds(), self.color));
+        let hwnd = input.hwnd;
+        if let (Some(crop), Some(font)) = (self.selection.filter(|_| keep), self.font.as_ref()) {
+            if let Some(mark) = input.finish(self.original.dc, font, crop) {
+                if !mark.fits(crop) {
+                    input.refresh(self.hwnd, self.original.dc, font, crop);
+                    unsafe { SetFocus(hwnd) };
+                    self.invalidate_draft();
+                    return false;
+                }
+                self.add_mark(Mark::text(mark, self.color));
             }
         }
+        self.text = None;
         unsafe {
-            DestroyWindow(input.hwnd);
+            DestroyWindow(hwnd);
             SetFocus(self.hwnd);
         }
         self.set_cursor(self.pointer);
-        self.repaint();
+        true
     }
 
     fn monitor_at(&self, point: Point) -> Area {
@@ -965,315 +1081,6 @@ impl Editor {
             palette_open: self.palette_open,
         })
     }
-
-    fn repaint(&self) {
-        unsafe {
-            InvalidateRect(self.hwnd, null(), 0);
-        }
-    }
-
-    fn paint(&self, destination: HDC) {
-        self.compose_frame();
-        unsafe {
-            BitBlt(
-                destination,
-                0,
-                0,
-                self.desktop.width(),
-                self.desktop.height(),
-                self.frame.dc,
-                0,
-                0,
-                SRCCOPY,
-            );
-        }
-    }
-
-    fn compose_frame(&self) {
-        let dc = self.frame.dc;
-        let width = self.desktop.width();
-        let height = self.desktop.height();
-        unsafe {
-            BitBlt(dc, 0, 0, width, height, self.shaded.dc, 0, 0, SRCCOPY);
-        }
-        let selection = self.selection.or_else(|| match &self.drag {
-            Some(drag) => self.selection_for_drag(drag),
-            None => self.pointer.and_then(|point| self.window_at(point)),
-        });
-        let Some(selection) = selection else { return };
-        unsafe {
-            BitBlt(
-                dc,
-                selection.left,
-                selection.top,
-                selection.width(),
-                selection.height(),
-                self.original.dc,
-                selection.left,
-                selection.top,
-                SRCCOPY,
-            );
-            let state = SaveDC(dc);
-            if state != 0 {
-                SetViewportOrgEx(dc, selection.left, selection.top, null_mut());
-                IntersectClipRect(dc, 0, 0, selection.width(), selection.height());
-                let changed = self
-                    .drag
-                    .as_ref()
-                    .and_then(|drag| self.transformed_mark(selection, drag));
-                let visible_mark = |index: usize| {
-                    changed
-                        .as_ref()
-                        .filter(|(changed_index, _)| *changed_index == index)
-                        .map(|(_, mark)| mark)
-                        .unwrap_or(&self.marks[index])
-                };
-                for index in 0..self.marks.len() {
-                    visible_mark(index).paint(dc, &self.font, selection, self.antialias.as_ref());
-                }
-                if let Some(mark) = self
-                    .drag
-                    .as_ref()
-                    .and_then(|drag| drag.drawn_mark(selection, self.color))
-                {
-                    mark.paint(dc, &self.font, selection, self.antialias.as_ref());
-                }
-                if let Some(index) = self.selected_mark {
-                    visible_mark(index).paint_controls(dc, selection.local_bounds());
-                }
-                if let Some(input) = &self.text {
-                    input.paint(dc, &self.font, selection, self.color);
-                }
-                RestoreDC(dc, state);
-            }
-            let border = CreateSolidBrush(appearance::ACCENT);
-            if !border.is_null() {
-                FrameRect(dc, &selection.rect(), border);
-                DeleteObject(border);
-            }
-            if let Some(layout) = self.toolbar_layout() {
-                let color = self
-                    .selected_mark
-                    .map_or(self.color, |index| self.marks[index].color);
-                layout.paint(
-                    dc,
-                    toolbar::State {
-                        active: self.tool,
-                        hovered: self.hovered,
-                        color,
-                        can_undo: !self.undo.is_empty(),
-                        can_redo: !self.redo.is_empty(),
-                    },
-                    self.antialias.as_ref(),
-                );
-            }
-        }
-    }
-
-    fn export(&self) -> io::Result<Image> {
-        let selection = self
-            .selection
-            .ok_or_else(|| io::Error::other("未选择截图区域"))?;
-        let width = selection.width();
-        let height = selection.height();
-        let image = Bitmap::new(width, height)?;
-        unsafe {
-            if BitBlt(
-                image.dc,
-                0,
-                0,
-                width,
-                height,
-                self.original.dc,
-                selection.left,
-                selection.top,
-                SRCCOPY,
-            ) == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            for mark in &self.marks {
-                mark.paint(
-                    image.dc,
-                    &self.font,
-                    selection.local_bounds(),
-                    self.antialias.as_ref(),
-                );
-            }
-            GdiFlush();
-        }
-        let mut rgb = Vec::with_capacity(image.length / 4 * 3);
-        for pixel in image.bytes().chunks_exact(4) {
-            rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
-        }
-        Ok(Image {
-            width: width as u32,
-            height: height as u32,
-            rgb,
-        })
-    }
-}
-
-struct Font {
-    handle: HFONT,
-    chinese_width: i32,
-    line_height: i32,
-}
-
-impl Font {
-    fn new(dc: HDC) -> io::Result<Self> {
-        let font = unsafe {
-            CreateFontW(
-                -ANNOTATION_FONT_HEIGHT,
-                0,
-                0,
-                0,
-                FW_NORMAL as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET as u32,
-                OUT_DEFAULT_PRECIS as u32,
-                CLIP_DEFAULT_PRECIS as u32,
-                ANTIALIASED_QUALITY as u32,
-                DEFAULT_PITCH as u32,
-                wide("Microsoft YaHei UI").as_ptr(),
-            )
-        };
-        if font.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        unsafe {
-            let previous = SelectObject(dc, font);
-            let mut metrics = TEXTMETRICW::default();
-            GetTextMetricsW(dc, &mut metrics);
-            let chinese_width = text::measure(dc, &['中' as u16]).max(1);
-            SelectObject(dc, previous);
-            Ok(Self {
-                handle: font,
-                chinese_width,
-                line_height: metrics.tmHeight.max(1),
-            })
-        }
-    }
-}
-
-impl Drop for Font {
-    fn drop(&mut self) {
-        unsafe {
-            DeleteObject(self.handle);
-        }
-    }
-}
-
-struct Bitmap {
-    dc: HDC,
-    bitmap: HBITMAP,
-    previous: HGDIOBJ,
-    bits: *mut u8,
-    length: usize,
-}
-
-impl Bitmap {
-    fn new(width: i32, height: i32) -> io::Result<Self> {
-        let length = (i64::from(width) * i64::from(height))
-            .checked_mul(4)
-            .and_then(|bytes| usize::try_from(bytes).ok())
-            .filter(|&length: &usize| width > 0 && height > 0 && length <= isize::MAX as usize)
-            .ok_or_else(|| io::Error::other("屏幕尺寸无效"))?;
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width,
-                biHeight: -height,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        unsafe {
-            let dc = CreateCompatibleDC(null_mut());
-            if dc.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            let mut bits = null_mut();
-            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-            if bitmap.is_null() || bits.is_null() {
-                let error = io::Error::last_os_error();
-                if !bitmap.is_null() {
-                    DeleteObject(bitmap);
-                }
-                DeleteDC(dc);
-                return Err(error);
-            }
-            let previous = SelectObject(dc, bitmap);
-            if previous.is_null() {
-                let error = io::Error::last_os_error();
-                DeleteObject(bitmap);
-                DeleteDC(dc);
-                return Err(error);
-            }
-            let bits = bits.cast::<u8>();
-            bits.write_bytes(0, length);
-            Ok(Self {
-                dc,
-                bitmap,
-                previous,
-                bits,
-                length,
-            })
-        }
-    }
-
-    fn capture(desktop: Area, monitors: &[Area]) -> io::Result<Self> {
-        let bitmap = Self::new(desktop.width(), desktop.height())?;
-        unsafe {
-            let dc = GetDC(null_mut());
-            if dc.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            let result = monitors.iter().try_for_each(|monitor| {
-                if BitBlt(
-                    bitmap.dc,
-                    monitor.left - desktop.left,
-                    monitor.top - desktop.top,
-                    monitor.width(),
-                    monitor.height(),
-                    dc,
-                    monitor.left,
-                    monitor.top,
-                    SRCCOPY | CAPTUREBLT,
-                ) == 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-            GdiFlush();
-            ReleaseDC(null_mut(), dc);
-            result?;
-        }
-        Ok(bitmap)
-    }
-
-    fn bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.bits, self.length) }
-    }
-    fn bytes_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.bits, self.length) }
-    }
-}
-
-impl Drop for Bitmap {
-    fn drop(&mut self) {
-        unsafe {
-            SelectObject(self.dc, self.previous);
-            DeleteObject(self.bitmap);
-            DeleteDC(self.dc);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1305,7 +1112,7 @@ mod tests {
             right: 130,
             bottom: 100,
         };
-        let frame = Bitmap::new(desktop.width(), desktop.height()).unwrap();
+        let frame = Bitmap::new(53, 47).unwrap();
         Editor {
             hwnd: null_mut(),
             owner: null_mut(),
@@ -1314,10 +1121,9 @@ mod tests {
             monitors: vec![desktop],
             windows: Vec::new(),
             original: Bitmap::new(desktop.width(), desktop.height()).unwrap(),
-            shaded: Bitmap::new(desktop.width(), desktop.height()).unwrap(),
-            font: Font::new(frame.dc).unwrap(),
-            antialias: strokes::Antialias::new(),
-            frame,
+            font: Some(Font::new(frame.dc).unwrap()),
+            antialias: OnceCell::new(),
+            frame: Some(frame),
             selection: Some(selection),
             toolbar: None,
             palette_open: false,
@@ -1333,6 +1139,7 @@ mod tests {
             redo: Vec::new(),
             text: None,
             finished: None,
+            save_busy: false,
         }
     }
 
@@ -1449,19 +1256,20 @@ mod tests {
             Mark::arrow(Point { x: 52, y: 10 }, Point { x: 90, y: 10 }, INK),
             Mark::text(
                 TextMark::new(
-                    editor.frame.dc,
-                    &editor.font,
+                    editor.original.dc,
+                    editor.font.as_ref().unwrap(),
                     selection,
                     Point { x: 8, y: 45 },
                     "中文".encode_utf16().collect(),
                 ),
-                selection.local_bounds(),
                 INK,
             ),
         ];
-        let image = editor.export().unwrap();
+        let image = editor.render_annotated_image(selection).unwrap();
         assert_eq!((image.width, image.height), (120, 80));
-        let pixel = |x: usize, y: usize| &image.rgb[(y * 120 + x) * 3..][..3];
+        let rgb = image.rgb();
+        let pixel = |x: usize, y: usize| &rgb[(y * 120 + x) * 3..][..3];
+        assert_eq!(pixel(0, 0), background);
         assert_eq!(pixel(22, 8), [231, 43, 52]);
         assert_eq!(pixel(22, 20), background);
         assert_eq!(pixel(70, 10), [231, 43, 52]);
@@ -1470,14 +1278,16 @@ mod tests {
             let p = pixel(x, y);
             p[0] > p[1] && p[0] > p[2]
         })));
-        editor.compose_frame();
+        let preview = Bitmap::new(desktop.width(), desktop.height()).unwrap();
+        editor.paint(preview.dc, &[desktop.local_bounds().rect()]);
         unsafe {
             GdiFlush();
         }
         let preview_pixel = |x, y| {
             let index = ((selection.top + y) * desktop.width() + selection.left + x) as usize * 4;
-            &editor.frame.bytes()[index..index + 3]
+            &preview.bytes()[index..index + 3]
         };
+        assert_eq!(preview_pixel(0, 0), [134, 220, 72]);
         assert_eq!(preview_pixel(22, 8), [52, 43, 231]);
         assert_eq!(preview_pixel(9, 46), [140, 90, 30]);
 
@@ -1498,9 +1308,10 @@ mod tests {
         assert_eq!(moved.bounds().right, selection.width());
         assert_eq!(moved.bounds().bottom, selection.height());
         assert_eq!(editor.cursor_at(Some(grab)), IDC_ARROW);
-        let image = editor.export().unwrap();
+        let image = editor.render_annotated_image(selection).unwrap();
         let old_pixel = (55 * image.width as usize + 11) * 3;
-        assert_eq!(image.rgb[old_pixel..old_pixel + 3], background);
+        let image = image.rgb();
+        assert_eq!(image[old_pixel..old_pixel + 3], background);
 
         use annotations::Edge::First;
         let scaled = editor.marks[2]
@@ -1512,24 +1323,24 @@ mod tests {
             .unwrap();
         let bounds = scaled.bounds();
         editor.change(Change::Replace(2, scaled));
-        let scaled_image = editor.export().unwrap();
-        let red_pixels = |image: &Image| {
+        let scaled_image = editor.render_annotated_image(selection).unwrap().rgb();
+        let red_pixels = |image: &[u8]| {
             (40..80)
                 .flat_map(|y| (60..120).map(move |x| (x, y)))
-                .filter(|&(x, y)| image.rgb[(y * 120 + x) * 3] > 180)
+                .filter(|&(x, y)| image[(y * 120 + x) * 3] > 180)
                 .count()
         };
         assert!(red_pixels(&scaled_image) > red_pixels(&image));
         let control_x = bounds.left as usize;
         let control_y = bounds.top as usize;
         let exported = (control_y * 120 + control_x) * 3;
-        assert_eq!(scaled_image.rgb[exported..exported + 3], background);
+        assert_eq!(scaled_image[exported..exported + 3], background);
     }
 
     #[test]
     fn diagonal_strokes_blend_edges_in_preview_and_export() {
         let mut editor = editor_with_selection();
-        assert!(editor.antialias.is_some());
+        assert!(editor.antialias().is_some());
         let crop = editor.selection.unwrap();
         let background = [20, 60, 160];
         for pixel in editor.original.bytes_mut().chunks_exact_mut(4) {
@@ -1549,9 +1360,10 @@ mod tests {
                 INK,
             ),
         ];
-        let image = editor.export().unwrap();
+        let image = editor.render_annotated_image(crop).unwrap();
+        let rgb = image.rgb();
         let blended = |from, to| {
-            image.rgb.chunks_exact(3).enumerate().any(|(index, pixel)| {
+            rgb.chunks_exact(3).enumerate().any(|(index, pixel)| {
                 let x = index % image.width as usize;
                 (from..to).contains(&x)
                     && (background[0] + 1..231).contains(&pixel[0])
@@ -1561,22 +1373,206 @@ mod tests {
         assert!(blended(0, 53));
         assert!(blended(60, 120));
 
-        editor.compose_frame();
+        let frame = Bitmap::new(editor.desktop.width(), editor.desktop.height()).unwrap();
+        editor.paint(frame.dc, &[editor.desktop.local_bounds().rect()]);
         unsafe { GdiFlush() };
         let preview = |x, y| {
             let index = (y * editor.desktop.width() + x) as usize * 4;
-            &editor.frame.bytes()[index..index + 3]
+            &frame.bytes()[index..index + 3]
         };
         for y in 1..crop.height() - 1 {
             for x in 1..crop.width() - 1 {
                 let index = (y * crop.width() + x) as usize * 3;
-                let [r, g, b] = image.rgb[index..index + 3] else {
+                let [r, g, b] = rgb[index..index + 3] else {
                     unreachable!()
                 };
                 assert_eq!(preview(crop.left + x, crop.top + y), [b, g, r]);
             }
         }
-        assert_eq!(preview(crop.left - 1, crop.top + 1), [0, 0, 0]);
+        let shaded = preview(crop.left - 1, crop.top + 1);
+        for (&channel, original) in shaded.iter().zip([160, 60, 20]) {
+            assert!((i32::from(channel) - original * 43 / 100).abs() <= 1);
+        }
+    }
+
+    #[test]
+    fn confirming_during_a_drag_exports_the_visible_mark_and_transform() {
+        let drawing_start = Point { x: 30, y: 42 };
+        let drawing_end = Point { x: 72, y: 75 };
+        let move_start = Point { x: 52, y: 59 };
+        let move_end = move_start + Point { x: 10, y: 9 };
+        let outline = |release: bool, transform: bool| {
+            let mut editor = editor_with_selection();
+            editor.mouse_down(drawing_start);
+            editor.mouse_move(drawing_end);
+            if transform {
+                editor.mouse_up(drawing_end);
+                editor.mouse_down(move_start);
+                editor.mouse_move(move_end);
+            }
+            if release {
+                editor.mouse_up(if transform { move_end } else { drawing_end });
+            }
+            editor.key_down(VK_RETURN);
+            assert_eq!(editor.finished, Some(true));
+            editor.export(usize::MAX).unwrap().rgb()
+        };
+        let drawn = outline(false, false);
+        let moved = outline(false, true);
+        assert!(drawn.chunks_exact(3).any(|pixel| pixel == [231, 43, 52]));
+        assert_ne!(drawn, moved);
+        assert_eq!(drawn, outline(true, false));
+        assert_eq!(moved, outline(true, true));
+    }
+
+    #[test]
+    fn exports_cropped_rows_after_releasing_the_desktop_bitmap() {
+        for annotated in [false, true] {
+            let mut editor = editor_with_selection();
+            let desktop = editor.desktop.local_bounds();
+            let crop = Area {
+                left: 17,
+                top: 13,
+                ..desktop
+            };
+            editor.selection = Some(crop);
+            let stride = desktop.width() as usize;
+            for (index, pixel) in editor.original.bytes_mut().chunks_exact_mut(4).enumerate() {
+                pixel.copy_from_slice(&[(index % stride) as u8, (index / stride) as u8, 121, 0]);
+            }
+            if annotated {
+                editor.marks.push(Mark::arrow(
+                    Point { x: 0, y: 0 },
+                    Point { x: 31, y: 21 },
+                    INK,
+                ));
+            }
+            let tight = editor.render_annotated_image(crop).unwrap().rgb();
+            let image = editor.export(usize::MAX).unwrap();
+            assert_eq!(
+                image.byte_len(),
+                desktop.width() as usize * desktop.height() as usize * 4
+            );
+            assert_eq!(image.height, crop.height() as u32);
+            assert_eq!(image.width, crop.width() as u32);
+            let rgb = image.rgb();
+            assert_eq!(
+                &rgb[rgb.len() - 3..],
+                &[121, (desktop.bottom - 1) as u8, (desktop.right - 1) as u8]
+            );
+            assert_eq!(rgb, tight);
+        }
+        let editor = editor_with_selection();
+        let crop = editor.selection.unwrap();
+        let length = crop.width() as usize * crop.height() as usize * 4;
+        assert!(editor.exceeds_save_budget(length - 1));
+        assert_eq!(editor.export(length).unwrap().byte_len(), length);
+    }
+
+    #[test]
+    fn busy_save_keeps_the_selection_and_annotations_available() {
+        let mut editor = editor_with_selection();
+        editor.add_mark(Mark::arrow(
+            Point { x: 3, y: 5 },
+            Point { x: 28, y: 10 },
+            INK,
+        ));
+        editor.finish(true);
+        EDITOR.with(|slot| slot.replace(Some(editor)));
+        assert!(complete(0).unwrap().is_none());
+        with_editor(|editor| {
+            assert!(editor.save_busy);
+            assert_eq!(editor.marks.len(), 1);
+            editor.finish(true);
+        });
+        assert!(complete(usize::MAX).unwrap().is_some());
+    }
+
+    #[test]
+    fn live_pen_damage_matches_full_render_for_a_long_crossing_stroke() {
+        let mut editor = editor_with_selection();
+        let desktop = editor.desktop.local_bounds();
+        let crop = editor.selection.unwrap();
+        editor.tool = Tool::Pen;
+        let partial = Bitmap::new(desktop.width(), desktop.height()).unwrap();
+        editor.paint(partial.dc, &[desktop.rect()]);
+
+        let points = (4..112)
+            .map(|x| Point {
+                x,
+                y: 14 + x * 3 % 57,
+            })
+            .chain((4..112).rev().map(|x| Point {
+                x,
+                y: 10 + x * 5 % 57,
+            }))
+            .collect::<Vec<_>>();
+        editor.mouse_down(crop.origin() + points[0]);
+        for (previous, &point) in points.iter().enumerate().skip(1) {
+            editor.mouse_move(crop.origin() + point);
+            let dirty = editor.pen_damage(previous).unwrap();
+            assert!(dirty.width() <= 8);
+            editor.paint(partial.dc, &[dirty.rect()]);
+        }
+        editor.discard_drag();
+        editor.marks.push(Mark::pen(points, editor.color));
+        editor.frame = Some(Bitmap::new(desktop.width(), desktop.height()).unwrap());
+        let full = Bitmap::new(desktop.width(), desktop.height()).unwrap();
+        editor.paint(full.dc, &[desktop.rect()]);
+        unsafe { GdiFlush() };
+        assert!(partial
+            .bytes()
+            .chunks_exact(4)
+            .zip(full.bytes().chunks_exact(4))
+            .all(|(actual, expected)| actual[..3] == expected[..3]));
+    }
+
+    #[test]
+    fn partial_repaint_matches_full_repaint_across_strokes_and_toolbar() {
+        let mut editor = editor_with_selection();
+        let desktop = editor.desktop.local_bounds();
+        editor.toolbar = Some(Point { x: 20, y: 102 });
+        editor.palette_open = true;
+        editor.add_mark(Mark::arrow(
+            Point { x: 4, y: 15 },
+            Point { x: 102, y: 60 },
+            INK,
+        ));
+        for pixel in editor.original.bytes_mut().chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[140, 90, 30, 0]);
+        }
+        let split = 54;
+        let full = Bitmap::new(desktop.width(), desktop.height()).unwrap();
+        editor.frame = Some(Bitmap::new(desktop.width(), desktop.height()).unwrap());
+        editor.paint(full.dc, &[desktop.rect()]);
+        unsafe { GdiFlush() };
+        let partial = Bitmap::new(desktop.width(), desktop.height()).unwrap();
+        editor.frame = Some(Bitmap::new(53, 47).unwrap());
+        editor.paint(
+            partial.dc,
+            &[Area {
+                right: split,
+                ..desktop
+            }
+            .rect()],
+        );
+        unsafe { GdiFlush() };
+        let column = (15 * desktop.width() + split) as usize * 4;
+        assert_eq!(&partial.bytes()[column..column + 3], &[0, 0, 0]);
+        editor.paint(
+            partial.dc,
+            &[Area {
+                left: split,
+                ..desktop
+            }
+            .rect()],
+        );
+        unsafe { GdiFlush() };
+        assert!(partial
+            .bytes()
+            .chunks_exact(4)
+            .zip(full.bytes().chunks_exact(4))
+            .all(|(actual, expected)| actual[..3] == expected[..3]));
     }
 
     #[test]
@@ -1607,18 +1603,17 @@ mod tests {
         editor.toolbar = Some(Point { x: 10, y: 107 });
         let selection = editor.selection.unwrap();
         let anchor = Point {
-            x: selection.width() - 2 * editor.font.chinese_width - 5,
+            x: selection.width() - 2 * editor.font.as_ref().unwrap().chinese_width - 5,
             y: 20,
         };
         editor.add_mark(Mark::text(
             TextMark::new(
-                editor.frame.dc,
-                &editor.font,
+                editor.original.dc,
+                editor.font.as_ref().unwrap(),
                 selection,
                 Point { x: 0, y: 0 },
                 "test".encode_utf16().collect(),
             ),
-            selection.local_bounds(),
             INK,
         ));
         let button_point = |target| {
@@ -1669,10 +1664,13 @@ mod tests {
             editor.open_text(selection, anchor);
             let input = editor.text.as_ref().unwrap();
             edit = input.hwnd;
-            assert_eq!(input.draft.bounds().width(), editor.font.chinese_width);
+            assert_eq!(
+                input.draft.bounds().width(),
+                editor.font.as_ref().unwrap().chinese_width
+            );
         });
         unsafe {
-            for unit in "中文标注测试".encode_utf16() {
+            for unit in "中文标注".encode_utf16() {
                 SendMessageW(edit, WM_CHAR, unit as WPARAM, 1);
             }
             let mut updated = MSG::default();
@@ -1684,12 +1682,13 @@ mod tests {
         }
         with_editor(|editor| {
             let bounds = editor.text.as_ref().unwrap().draft.bounds();
-            assert!(bounds.width() > editor.font.chinese_width);
+            let font = editor.font.as_ref().unwrap();
+            assert!(bounds.width() > font.chinese_width);
             assert!(bounds.right <= selection.width());
-            assert!(bounds.height() > editor.font.line_height);
+            assert!(bounds.height() > font.line_height);
             assert_eq!(
                 crate::control_text(edit),
-                "中文标注测试".encode_utf16().collect::<Vec<_>>()
+                "中文标注".encode_utf16().collect::<Vec<_>>()
             );
         });
         let draft_point = Point {
@@ -1701,9 +1700,33 @@ mod tests {
         send_mouse(WM_LBUTTONDBLCLK, draft_point);
         check_saved(2);
 
+        with_editor(|editor| {
+            editor.tool = Tool::Text;
+            editor.open_text(selection, anchor);
+            edit = editor.text.as_ref().unwrap().hwnd;
+        });
+        unsafe {
+            SetWindowTextW(edit, wide("\r\n\r\n\r\n\r\n\r\n文字").as_ptr());
+            SendMessageW(hwnd, TEXT_FINISHED, 1, 0);
+        }
+        send_mouse(WM_LBUTTONDBLCLK, draft_point);
+        with_editor(|editor| {
+            assert_eq!(editor.finished, None);
+            assert_eq!(editor.marks.len(), 2);
+            assert!(editor.text.as_ref().unwrap().overflows(selection));
+        });
+        unsafe {
+            SetWindowTextW(edit, wide("文字").as_ptr());
+            SendMessageW(hwnd, TEXT_FINISHED, 1, 0);
+        }
+        with_editor(|editor| {
+            assert!(editor.text.is_none());
+            assert_eq!(editor.marks.len(), 3);
+        });
+
         send_mouse(WM_LBUTTONDOWN, cancel);
         send_mouse(WM_LBUTTONUP, cancel);
         unsafe { SendMessageW(hwnd, WM_TIMER, CLICK_TIMER, 0) };
-        assert!(complete().unwrap().is_none());
+        assert!(complete(usize::MAX).unwrap().is_none());
     }
 }

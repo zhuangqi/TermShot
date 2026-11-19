@@ -1,16 +1,11 @@
 use super::{strokes, Area, Point, Tool, INK};
-use crate::appearance::{fill, rgb, round};
+use crate::appearance::{
+    fill, primary_fill, rgb, round, selected_fill, ACCENT, ACCENT_TEXT, BORDER, CONTROL_BORDER,
+    CONTROL_CORNER, HOVER, MUTED, PANEL, PANEL_CORNER, SELECTED_BORDER, SELECTED_TEXT, TEXT,
+};
 use windows_sys::Win32::Foundation::{COLORREF, POINT};
 use windows_sys::Win32::Graphics::Gdi::*;
 
-const PANEL: COLORREF = rgb(26, 34, 48);
-const BORDER: COLORREF = rgb(52, 65, 87);
-const ACTIVE: COLORREF = rgb(38, 76, 86);
-const HOVER: COLORREF = rgb(50, 61, 81);
-const ICON: COLORREF = rgb(228, 235, 246);
-const MUTED: COLORREF = rgb(111, 126, 148);
-const ACCENT: COLORREF = rgb(102, 218, 198);
-const ACCENT_HOVER: COLORREF = rgb(151, 237, 222);
 const PADDING: i32 = 6;
 const GAP: i32 = 3;
 const BUTTON_SIZE: i32 = 44;
@@ -62,12 +57,14 @@ const BUTTONS: [Button; 12] = [
     Button::Save,
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Layout {
     pub origin: Point,
     pub monitor: Area,
     pub palette_open: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct State {
     pub active: Tool,
     pub hovered: Option<Button>,
@@ -84,6 +81,10 @@ enum Glyph {
 impl Layout {
     pub fn panel(&self) -> Area {
         area_at(self.origin, WIDTH, HEIGHT)
+    }
+
+    pub fn panels(&self) -> impl Iterator<Item = Area> + '_ {
+        std::iter::once(self.panel()).chain(self.palette())
     }
 
     pub fn buttons(&self) -> impl Iterator<Item = (Button, Area)> {
@@ -151,7 +152,7 @@ impl Layout {
 
     pub unsafe fn paint(&self, dc: HDC, state: State, antialias: Option<&strokes::Antialias>) {
         let mut glyphs = Vec::with_capacity(BUTTONS.len() + COLORS.len());
-        round(dc, &self.panel().rect(), 16, PANEL, BORDER);
+        round(dc, &self.panel().rect(), PANEL_CORNER, PANEL, BORDER);
         for (button, area) in self.buttons() {
             if matches!(button, Button::Palette | Button::Undo | Button::Cancel) {
                 let rule = area_at(
@@ -169,24 +170,26 @@ impl Layout {
                 || (button == Button::Palette && self.palette_open);
             let unavailable = (button == Button::Undo && !state.can_undo)
                 || (button == Button::Redo && !state.can_redo);
-            let (background, foreground) = if button == Button::Save {
-                (if hovered { ACCENT_HOVER } else { ACCENT }, PANEL)
+            let (background, border, foreground) = if button == Button::Save {
+                let background = primary_fill(hovered, false);
+                (background, background, ACCENT_TEXT)
             } else if selected {
-                (ACTIVE, ACCENT_HOVER)
+                (selected_fill(hovered), SELECTED_BORDER, SELECTED_TEXT)
             } else if hovered && !unavailable {
-                (HOVER, ICON)
+                (HOVER, CONTROL_BORDER, TEXT)
             } else {
                 (
+                    PANEL,
                     PANEL,
                     if unavailable || button == Button::Grip {
                         MUTED
                     } else {
-                        ICON
+                        TEXT
                     },
                 )
             };
             if background != PANEL {
-                round(dc, &area.rect(), 10, background, background);
+                round(dc, &area.rect(), CONTROL_CORNER, background, border);
             }
             if button == Button::Palette {
                 glyphs.push(Glyph::Swatch(
@@ -199,15 +202,22 @@ impl Layout {
             }
         }
         if let Some(palette) = self.palette() {
-            round(dc, &palette.rect(), 12, PANEL, BORDER);
+            round(dc, &palette.rect(), PANEL_CORNER, PANEL, BORDER);
             for (button, area) in Self::swatches(palette) {
                 let Button::Swatch(color) = button else {
                     unreachable!()
                 };
-                let outline = if color == state.color { ACCENT } else { MUTED };
-                if state.hovered == Some(button) {
-                    round(dc, &area.rect(), 8, HOVER, HOVER);
+                let hovered = state.hovered == Some(button);
+                let selected = color == state.color;
+                if selected || hovered {
+                    let (surface, border) = if selected {
+                        (selected_fill(hovered), SELECTED_BORDER)
+                    } else {
+                        (HOVER, CONTROL_BORDER)
+                    };
+                    round(dc, &area.rect(), CONTROL_CORNER, surface, border);
                 }
+                let outline = if selected { ACCENT } else { MUTED };
                 glyphs.push(Glyph::Swatch(swatch_bounds(area, 10), color, outline));
             }
         }
@@ -406,10 +416,10 @@ mod tests {
         }
         for (button, foreground) in [
             (Button::Grip, MUTED),
-            (Button::Tool(Tool::Arrow), ICON),
-            (Button::Tool(Tool::Pen), ICON),
-            (Button::Palette, ICON),
-            (Button::Cancel, ICON),
+            (Button::Tool(Tool::Arrow), TEXT),
+            (Button::Tool(Tool::Pen), TEXT),
+            (Button::Palette, TEXT),
+            (Button::Cancel, TEXT),
         ] {
             let (_, area) = layout
                 .buttons()

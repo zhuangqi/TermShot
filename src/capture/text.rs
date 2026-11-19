@@ -1,5 +1,5 @@
 use super::{Area, Font, Point};
-use crate::{appearance::ACCENT, control_text, create_control};
+use crate::{appearance, control_text, create_control};
 use std::ops::Range;
 use std::ptr::null_mut;
 use unicode_segmentation::UnicodeSegmentation;
@@ -12,6 +12,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 pub(super) const UPDATED: u32 = WM_APP + 11;
 pub(super) const IME_POSITION: u32 = WM_APP + 12;
+pub(super) const OVERFLOW: COLORREF = appearance::rgb(177, 34, 42);
 
 pub(super) struct TextMark {
     pub origin: Point,
@@ -22,6 +23,7 @@ struct TextLayout {
     units: Vec<u16>,
     lines: Vec<TextLine>,
     width: i32,
+    content_width: i32,
     line_height: i32,
 }
 
@@ -81,16 +83,13 @@ impl TextLayout {
         }
         unsafe { SelectObject(dc, previous) };
         lines.push(line);
-        let width = lines
-            .iter()
-            .map(|line| line.end().1)
-            .max()
-            .unwrap_or(0)
-            .clamp(font.chinese_width.min(limit), limit);
+        let content_width = lines.iter().map(|line| line.end().1).max().unwrap_or(0);
+        let width = content_width.clamp(font.chinese_width.min(limit), limit);
         Self {
             units,
             lines,
             width,
+            content_width,
             line_height: font.line_height,
         }
     }
@@ -157,6 +156,11 @@ impl TextMark {
             right: self.origin.x + self.layout.width,
             bottom: self.origin.y + self.layout.height(),
         }
+    }
+
+    pub fn fits(&self, crop: Area) -> bool {
+        self.layout.content_width <= crop.width() - self.origin.x
+            && self.layout.height() <= crop.height() - self.origin.y
     }
 
     pub unsafe fn paint(&self, dc: HDC, font: &Font, origin: Point, color: COLORREF) {
@@ -297,6 +301,15 @@ impl TextInput {
             .then(|| TextMark::new(dc, font, crop, self.anchor, units))
     }
 
+    pub fn overflows(&self, crop: Area) -> bool {
+        !self.draft.fits(crop)
+            && char::decode_utf16(self.draft.layout.units.iter().copied()).any(|character| {
+                !character
+                    .unwrap_or(char::REPLACEMENT_CHARACTER)
+                    .is_whitespace()
+            })
+    }
+
     fn caret_position(&self, index: usize, crop: Area) -> Point {
         let offset = self.draft.layout.caret(index);
         Point {
@@ -355,7 +368,12 @@ impl TextInput {
         let layout = &self.draft.layout;
         let origin = self.draft.origin;
         let area = self.draft.bounds();
-        let brush = CreateSolidBrush(ACCENT);
+        let edge = if self.overflows(crop) {
+            OVERFLOW
+        } else {
+            appearance::ACCENT
+        };
+        let brush = CreateSolidBrush(edge);
         if !brush.is_null() {
             FrameRect(dc, &area.rect(), brush);
             DeleteObject(brush);
@@ -368,16 +386,30 @@ impl TextInput {
                 let end = underlined.end.min(line.end().0);
                 if start < end {
                     let y = origin.y + (row as i32 + 1) * layout.line_height - 2;
-                    for x in line.x_at(start)..line.x_at(end).min(layout.width) {
-                        SetPixelV(dc, origin.x + x, y, ACCENT);
-                    }
+                    appearance::fill(
+                        dc,
+                        &RECT {
+                            left: origin.x + line.x_at(start),
+                            top: y,
+                            right: origin.x + line.x_at(end).min(layout.width),
+                            bottom: y + 1,
+                        },
+                        appearance::ACCENT,
+                    );
                 }
             }
         }
         let caret = self.caret_position(self.caret, crop);
-        for y in caret.y + 2..caret.y + layout.line_height - 2 {
-            SetPixelV(dc, caret.x, y, color);
-        }
+        appearance::fill(
+            dc,
+            &RECT {
+                left: caret.x,
+                top: caret.y + 2,
+                right: caret.x + 1,
+                bottom: caret.y + layout.line_height - 2,
+            },
+            color,
+        );
     }
 }
 

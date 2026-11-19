@@ -1,5 +1,5 @@
 use super::{strokes, Area, Font, Point, TextMark};
-use crate::appearance::{fill, rgb, WHITE};
+use crate::appearance::{fill, ACCENT, WHITE};
 use std::rc::Rc;
 use windows_sys::Win32::Foundation::COLORREF;
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -7,7 +7,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const HANDLE_RADIUS: i32 = 4;
 const HIT_RADIUS: i32 = 6;
-const SELECTION: COLORREF = rgb(23, 168, 158);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Tool {
@@ -90,8 +89,8 @@ impl Mark {
         }
     }
 
-    pub fn text(text: TextMark, crop: Area, color: COLORREF) -> Self {
-        let source = text.bounds().intersection(crop).unwrap();
+    pub fn text(text: TextMark, color: COLORREF) -> Self {
+        let source = text.bounds();
         Self {
             color,
             shape: Shape::Text {
@@ -108,6 +107,25 @@ impl Mark {
                 bounds
             }
             Shape::Arrow(start, end) => point_bounds(start, end),
+        }
+    }
+
+    pub fn paint_bounds(&self) -> Area {
+        match self.shape {
+            Shape::Text { bounds, .. } => bounds,
+            Shape::Arrow(start, end) => {
+                let [left, _, right] = arrow_head(start, end);
+                self.bounds().union(point_bounds(left, right)).padded(3)
+            }
+            _ => self.bounds().padded(3),
+        }
+    }
+
+    pub fn controls_bounds(&self, crop: Area) -> Area {
+        if let Shape::Arrow(tail, tip) = self.shape {
+            point_bounds(handle_center(tail, crop), handle_center(tip, crop)).padded(HANDLE_RADIUS)
+        } else {
+            control_frame(self.bounds(), crop).padded(HANDLE_RADIUS)
         }
     }
 
@@ -140,6 +158,9 @@ impl Mark {
                 source,
                 bounds,
             } => {
+                if !bounds.padded(HIT_RADIUS).contains(point) {
+                    return false;
+                }
                 let map = |p| scale_point(p, *source, *bounds);
                 if points.len() == 1 {
                     let p = map(points[0]);
@@ -272,7 +293,7 @@ impl Mark {
     pub unsafe fn paint(
         &self,
         dc: HDC,
-        font: &Font,
+        font: Option<&Font>,
         crop: Area,
         antialias: Option<&strokes::Antialias>,
     ) {
@@ -282,6 +303,7 @@ impl Mark {
             bounds,
         } = &self.shape
         {
+            let Some(font) = font else { return };
             let state = SaveDC(dc);
             if state == 0 {
                 return;
@@ -335,6 +357,10 @@ impl Mark {
                 source,
                 bounds,
             } => {
+                if points.len() > 1 && source == bounds {
+                    strokes::paint(dc, crop, self.color, antialias, &[points]);
+                    return;
+                }
                 let mut line: Vec<_> = points
                     .iter()
                     .map(|&p| scale_point(p, *source, *bounds))
@@ -351,7 +377,7 @@ impl Mark {
     pub unsafe fn paint_controls(&self, dc: HDC, crop: Area) {
         if !matches!(self.shape, Shape::Arrow(..)) {
             let frame = control_frame(self.bounds(), crop);
-            let pen = CreatePen(PS_DOT, 1, SELECTION);
+            let pen = CreatePen(PS_DOT, 1, ACCENT);
             if !pen.is_null() {
                 let previous = SelectObject(dc, pen);
                 let brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -376,7 +402,7 @@ impl Mark {
                         y: HANDLE_RADIUS,
                     },
             );
-            fill(dc, &outer.rect(), SELECTION);
+            fill(dc, &outer.rect(), ACCENT);
             let inner = Area {
                 left: outer.left + 1,
                 top: outer.top + 1,
@@ -518,15 +544,23 @@ pub(super) enum Change {
 }
 
 impl Change {
-    pub fn apply(self, marks: &mut Vec<Mark>) -> Self {
+    pub fn apply(self, marks: &mut Vec<Mark>) -> (Self, Option<Area>, Option<Area>) {
         match self {
             Self::Insert(index, mark) => {
+                let after = mark.paint_bounds();
                 marks.insert(index, mark);
-                Self::Remove(index)
+                (Self::Remove(index), None, Some(after))
             }
-            Self::Remove(index) => Self::Insert(index, marks.remove(index)),
+            Self::Remove(index) => {
+                let removed = marks.remove(index);
+                let before = removed.paint_bounds();
+                (Self::Insert(index, removed), Some(before), None)
+            }
             Self::Replace(index, mark) => {
-                Self::Replace(index, std::mem::replace(&mut marks[index], mark))
+                let after = mark.paint_bounds();
+                let replaced = std::mem::replace(&mut marks[index], mark);
+                let before = replaced.paint_bounds();
+                (Self::Replace(index, replaced), Some(before), Some(after))
             }
         }
     }

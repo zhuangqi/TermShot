@@ -1,14 +1,18 @@
 #![windows_subsystem = "windows"]
 
 mod appearance;
+mod background;
 mod capture;
 mod preferences;
 mod storage;
 
+use background::{Background, Outcome};
 use std::cell::RefCell;
 use std::io;
+use std::path::PathBuf;
 use std::ptr::{null, null_mut};
-use storage::{wide, Hotkey, Settings, Storage};
+use std::time::Instant;
+use storage::{wide, ClipboardError, Hotkey, Settings, Storage};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -24,6 +28,9 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_CAPTURE_FINISHED: u32 = WM_APP + 2;
 const WM_OPEN_SETTINGS: u32 = WM_APP + 3;
 const CLEANUP_TIMER: usize = 1;
+const CLIPBOARD_TIMER: usize = 2;
+const CLIPBOARD_RETRIES: u8 = 5;
+const CLIPBOARD_RETRY_MS: u32 = 50;
 const TRAY_SETTINGS: usize = 101;
 const TRAY_FOLDER: usize = 102;
 const TRAY_EXIT: usize = 103;
@@ -41,7 +48,18 @@ struct App {
     preferences: HWND,
     hotkey_id: Option<i32>,
     cleanup_enabled: bool,
+    cleanup_pending: bool,
+    cleanup_again: bool,
+    cleanup_deadline: Option<Instant>,
+    background: Background,
+    clipboard: Option<PendingClipboard>,
+    exiting: bool,
     taskbar_created: u32,
+}
+
+struct PendingClipboard {
+    path: PathBuf,
+    retries: u8,
 }
 
 fn main() {
@@ -94,6 +112,14 @@ fn run() -> io::Result<()> {
         if hwnd.is_null() {
             return Err(io::Error::last_os_error());
         }
+        let background = Background::start(
+            hwnd,
+            storage.clone(),
+            settings
+                .as_ref()
+                .ok()
+                .map(|settings| settings.retention_minutes),
+        )?;
         let mut app = App {
             hwnd,
             instance,
@@ -103,6 +129,12 @@ fn run() -> io::Result<()> {
             preferences: null_mut(),
             hotkey_id: None,
             cleanup_enabled: settings.is_ok(),
+            cleanup_pending: false,
+            cleanup_again: false,
+            cleanup_deadline: None,
+            background,
+            clipboard: None,
+            exiting: false,
             taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
         };
         if !app.show_tray() {
@@ -112,9 +144,9 @@ fn run() -> io::Result<()> {
         if hotkey_ready {
             app.hotkey_id = Some(1);
         }
-        app.schedule_cleanup();
         let hotkey = app.settings.hotkey.label();
         APP.with(|slot| slot.replace(Some(app)));
+        request_cleanup(hwnd);
         if let Err(error) = settings {
             alert(
                 hwnd,
@@ -171,7 +203,7 @@ unsafe extern "system" fn controller_proc(
         WM_HOTKEY => {
             let target = with_app(|app| {
                 app.hotkey_id
-                    .filter(|&id| id as usize == wparam)
+                    .filter(|&id| !app.exiting && id as usize == wparam)
                     .map(|_| app.instance)
             })
             .flatten();
@@ -181,35 +213,30 @@ unsafe extern "system" fn controller_proc(
                 }
             }
         }
-        WM_CAPTURE_FINISHED => match capture::complete() {
-            Ok(Some(image)) => {
-                let saved =
-                    with_app(|app| app.storage.save_png(image.width, image.height, &image.rgb));
-                match saved {
-                    Some(Ok(path)) => {
-                        with_app(App::schedule_cleanup);
-                        if let Err(error) = storage::copy_path(hwnd, &path) {
-                            alert(
-                                hwnd,
-                                &format!("截图已保存，复制路径失败。\n{}\n{error}", path.display()),
-                            );
-                        }
+        WM_CAPTURE_FINISHED => {
+            match capture::complete(with_app(|app| app.background.save_budget()).unwrap_or(0)) {
+                Ok(Some(image)) => {
+                    if let Some(Err(error)) = with_app(|app| app.background.save(image)) {
+                        alert(hwnd, &format!("无法保存截图。\n{error}"));
                     }
-                    Some(Err(error)) => alert(hwnd, &format!("无法保存截图。\n{error}")),
-                    None => (),
                 }
+                Ok(None) => (),
+                Err(error) => alert(hwnd, &format!("无法生成截图。\n{error}")),
             }
-            Ok(None) => (),
-            Err(error) => alert(hwnd, &format!("无法生成截图。\n{error}")),
-        },
+        }
+        background::READY => receive_background(hwnd),
         WM_TIMER if wparam == CLEANUP_TIMER => {
-            with_app(App::schedule_cleanup);
+            request_cleanup(hwnd);
+        }
+        WM_TIMER if wparam == CLIPBOARD_TIMER => {
+            copy_saved_path(hwnd);
+            exit_when_ready(hwnd);
         }
         WM_POWERBROADCAST if wparam == 7 || wparam == 18 => {
-            with_app(App::schedule_cleanup);
+            request_cleanup(hwnd);
         }
         WM_TIMECHANGE => {
-            with_app(App::schedule_cleanup);
+            request_cleanup(hwnd);
         }
         WM_TRAY if lparam as u32 == WM_RBUTTONUP => show_menu(hwnd),
         WM_TRAY if lparam as u32 == WM_LBUTTONDBLCLK => open_preferences(),
@@ -218,7 +245,8 @@ unsafe extern "system" fn controller_proc(
             TRAY_SETTINGS => open_preferences(),
             TRAY_FOLDER => open_folder(hwnd),
             TRAY_EXIT => {
-                DestroyWindow(hwnd);
+                with_app(|app| app.exiting = true);
+                exit_when_ready(hwnd);
             }
             _ => (),
         },
@@ -233,6 +261,12 @@ unsafe extern "system" fn controller_proc(
                     UnregisterHotKey(hwnd, id);
                 }
                 KillTimer(hwnd, CLEANUP_TIMER);
+                KillTimer(hwnd, CLIPBOARD_TIMER);
+            });
+            APP.with(|slot| {
+                if let Ok(mut app) = slot.try_borrow_mut() {
+                    app.take();
+                }
             });
             PostQuitMessage(0);
         }
@@ -276,17 +310,82 @@ impl App {
         unsafe { RegisterHotKey(self.hwnd, id, hotkey.modifiers | MOD_NOREPEAT, hotkey.key) != 0 }
     }
 
-    fn schedule_cleanup(&mut self) {
+    fn request_cleanup(&mut self) -> io::Result<()> {
         unsafe {
             KillTimer(self.hwnd, CLEANUP_TIMER);
         }
+        self.cleanup_deadline = None;
         if !self.cleanup_enabled {
-            return;
+            return Ok(());
         }
-        if let Some(delay) = self.storage.clean(self.settings.retention_minutes) {
-            let wait = delay.clamp(10, 0x7fffffff) as u32;
-            unsafe {
-                SetTimer(self.hwnd, CLEANUP_TIMER, wait, None);
+        if self.cleanup_pending {
+            self.cleanup_again = true;
+            return Ok(());
+        }
+        self.background.clean()?;
+        self.cleanup_pending = true;
+        Ok(())
+    }
+
+    fn cleanup_finished(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+        self.cleanup_pending = false;
+        if std::mem::take(&mut self.cleanup_again) {
+            return self.request_cleanup();
+        }
+        if let Some(deadline) = deadline {
+            return self.schedule_cleanup(deadline);
+        }
+        Ok(())
+    }
+
+    fn schedule_cleanup(&mut self, deadline: Instant) -> io::Result<()> {
+        if self
+            .cleanup_deadline
+            .is_some_and(|current| current <= deadline)
+        {
+            return Ok(());
+        }
+        let delay = deadline.saturating_duration_since(Instant::now());
+        let wait = delay.as_millis().clamp(10, 0x7fff_ffff) as u32;
+        if unsafe { SetTimer(self.hwnd, CLEANUP_TIMER, wait, None) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.cleanup_deadline = Some(deadline);
+        Ok(())
+    }
+
+    fn capture_saved(&mut self, saved: storage::SavedCapture) -> io::Result<()> {
+        let deadline = self
+            .cleanup_enabled
+            .then(|| Instant::now().checked_add(saved.expires_in(self.settings.retention_minutes)))
+            .flatten();
+        self.clipboard = Some(PendingClipboard {
+            path: saved.path,
+            retries: CLIPBOARD_RETRIES,
+        });
+        if let Some(deadline) = deadline.filter(|_| !self.cleanup_pending) {
+            self.schedule_cleanup(deadline)?;
+        }
+        Ok(())
+    }
+
+    fn copy_saved_path(&mut self) -> Result<(), (PathBuf, io::Error)> {
+        unsafe { KillTimer(self.hwnd, CLIPBOARD_TIMER) };
+        let Some(mut pending) = self.clipboard.take() else {
+            return Ok(());
+        };
+        match storage::copy_path(self.hwnd, &pending.path) {
+            Ok(()) => Ok(()),
+            Err(ClipboardError::Busy(error)) if pending.retries > 0 => {
+                pending.retries -= 1;
+                if unsafe { SetTimer(self.hwnd, CLIPBOARD_TIMER, CLIPBOARD_RETRY_MS, None) } == 0 {
+                    return Err((pending.path, error));
+                }
+                self.clipboard = Some(pending);
+                Ok(())
+            }
+            Err(ClipboardError::Busy(error) | ClipboardError::Failed(error)) => {
+                Err((pending.path, error))
             }
         }
     }
@@ -321,8 +420,54 @@ impl App {
         }
         self.settings = settings;
         self.cleanup_enabled = true;
-        self.schedule_cleanup();
+        self.background.set_retention(settings.retention_minutes);
         Ok(())
+    }
+}
+
+fn request_cleanup(hwnd: HWND) {
+    if let Some(Err(error)) = with_app(App::request_cleanup) {
+        alert(hwnd, &format!("无法安排截图清理。\n{error}"));
+    }
+}
+
+fn receive_background(hwnd: HWND) {
+    while let Some(outcome) = with_app(|app| app.background.receive()).flatten() {
+        match outcome {
+            Outcome::Saved(result) => match result {
+                Ok(saved) => {
+                    let cleanup = with_app(|app| app.capture_saved(saved));
+                    copy_saved_path(hwnd);
+                    if let Some(Err(error)) = cleanup {
+                        alert(hwnd, &format!("无法安排截图清理。\n{error}"));
+                    }
+                }
+                Err(error) => alert(hwnd, &format!("无法保存截图。\n{error}")),
+            },
+            Outcome::Cleaned(deadline) => {
+                if let Some(Err(error)) = with_app(|app| app.cleanup_finished(deadline)) {
+                    alert(hwnd, &format!("无法安排截图清理。\n{error}"));
+                }
+            }
+        }
+    }
+    exit_when_ready(hwnd);
+}
+
+fn copy_saved_path(hwnd: HWND) {
+    if let Some(Err((path, error))) = with_app(App::copy_saved_path) {
+        alert(
+            hwnd,
+            &format!("截图已保存，复制路径失败。\n{}\n{error}", path.display()),
+        );
+    }
+}
+
+fn exit_when_ready(hwnd: HWND) {
+    if with_app(|app| app.exiting && !app.background.is_saving() && app.clipboard.is_none())
+        == Some(true)
+    {
+        unsafe { DestroyWindow(hwnd) };
     }
 }
 

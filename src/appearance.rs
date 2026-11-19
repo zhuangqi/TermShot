@@ -1,18 +1,48 @@
 use crate::storage::wide;
-use windows_sys::Win32::Foundation::RECT;
+use windows_sys::Win32::Foundation::{COLORREF, RECT};
 use windows_sys::Win32::Graphics::Gdi::*;
 
-pub const NAVY: u32 = rgb(24, 38, 64);
-pub const ACCENT: u32 = rgb(35, 87, 211);
-pub const ACCENT_HOVER: u32 = rgb(24, 68, 179);
-pub const CANVAS: u32 = rgb(245, 247, 252);
-pub const BORDER: u32 = rgb(222, 228, 239);
-pub const MUTED: u32 = rgb(83, 99, 123);
-pub const TINT: u32 = rgb(232, 239, 255);
 pub const WHITE: u32 = rgb(255, 255, 255);
+pub const WINDOW: COLORREF = rgb(24, 24, 28);
+pub const PANEL: COLORREF = rgb(32, 32, 37);
+pub const FOOTER: COLORREF = rgb(21, 21, 25);
+pub const FIELD: COLORREF = rgb(26, 26, 31);
+pub const BORDER: COLORREF = rgb(52, 52, 61);
+pub const CONTROL_BORDER: COLORREF = rgb(65, 65, 76);
+pub const HOVER: COLORREF = rgb(43, 43, 51);
+pub const PRESSED: COLORREF = rgb(58, 58, 69);
+pub const SELECTED_BORDER: COLORREF = rgb(204, 98, 117);
+pub const SELECTED_TEXT: COLORREF = rgb(255, 219, 225);
+pub const FOCUS_BORDER: COLORREF = rgb(242, 192, 205);
+pub const TEXT: COLORREF = rgb(243, 242, 246);
+pub const SECONDARY: COLORREF = rgb(174, 173, 186);
+pub const MUTED: COLORREF = rgb(118, 116, 132);
+pub const ACCENT: COLORREF = rgb(255, 103, 116);
+pub const ACCENT_HOVER: COLORREF = rgb(255, 131, 142);
+pub const ACCENT_TEXT: COLORREF = rgb(38, 13, 21);
+pub const PANEL_CORNER: i32 = 12;
+pub const CONTROL_CORNER: i32 = 7;
 
 pub const fn rgb(red: u32, green: u32, blue: u32) -> u32 {
     red | (green << 8) | (blue << 16)
+}
+
+pub fn primary_fill(hovered: bool, pressed: bool) -> COLORREF {
+    if pressed {
+        rgb(227, 84, 98)
+    } else if hovered {
+        ACCENT_HOVER
+    } else {
+        ACCENT
+    }
+}
+
+pub fn selected_fill(hovered: bool) -> COLORREF {
+    if hovered {
+        rgb(119, 54, 69)
+    } else {
+        rgb(102, 47, 60)
+    }
 }
 
 pub unsafe fn fill(dc: HDC, rect: &RECT, color: u32) {

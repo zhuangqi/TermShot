@@ -1,13 +1,19 @@
+use crate::capture::Image;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Write};
-use std::os::windows::ffi::OsStrExt;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::os::windows::{
+    ffi::OsStrExt,
+    fs::{MetadataExt, OpenOptionsExt},
+};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::GlobalFree;
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+use windows_sys::Win32::Storage::FileSystem::{
+    MoveFileExW, FILE_ATTRIBUTE_REPARSE_POINT, MOVEFILE_REPLACE_EXISTING,
+};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
@@ -19,6 +25,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 const CF_UNICODETEXT: u32 = 13;
 const DELETE_RETRY_MS: u64 = 30_000;
 const PNG_SOFTWARE: &str = "CliScreenshot";
+const CAPTURE_TEMP: &str = "capture-tmp";
+const LEGACY_HEADER_BYTES: u64 = 128;
 static SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
 pub fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
@@ -86,9 +94,21 @@ impl Default for Settings {
     }
 }
 
+#[derive(Clone)]
 pub struct Storage {
     root: PathBuf,
     pub captures: PathBuf,
+}
+
+pub struct SavedCapture {
+    pub path: PathBuf,
+    saved_at: u64,
+}
+
+impl SavedCapture {
+    pub fn expires_in(&self, minutes: u32) -> Duration {
+        Duration::from_millis(remaining_ms(self.saved_at, minutes, now_ms()))
+    }
 }
 
 impl Storage {
@@ -142,29 +162,34 @@ impl Storage {
         result
     }
 
-    pub fn save_png(&self, width: u32, height: u32, rgb: &[u8]) -> io::Result<PathBuf> {
+    pub fn save_png(&self, image: &Image) -> io::Result<SavedCapture> {
         fs::create_dir_all(&self.captures)?;
+        let temporary_dir = self.root.join(CAPTURE_TEMP);
+        fs::create_dir_all(&temporary_dir)?;
+        if !is_private_temp_dir(&temporary_dir)? {
+            return Err(io::Error::other("截图临时目录必须是普通目录"));
+        }
         let pid = std::process::id();
         let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = self
-            .captures
-            .join(format!("shot-{}-{pid}-{sequence}.part", now_ms()));
+        let temporary = temporary_dir.join(format!("shot-{}-{pid}-{sequence}.part", now_ms()));
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .share_mode(0)
             .open(&temporary)?;
         let result = (|| {
             let mut buffered = BufWriter::new(file);
-            write_png(&mut buffered, width, height, rgb)?;
+            write_png(&mut buffered, image)?;
             buffered.flush()?;
             drop(buffered);
+            let saved_at = now_ms();
             let path = self
                 .captures
-                .join(format!("shot-{}-{pid}-{sequence}.png", now_ms()));
+                .join(format!("shot-{saved_at}-{pid}-{sequence}.png"));
             if unsafe { MoveFileExW(wide(&temporary).as_ptr(), wide(&path).as_ptr(), 0) } == 0 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(path)
+            Ok(SavedCapture { path, saved_at })
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
@@ -172,36 +197,90 @@ impl Storage {
         result
     }
 
-    pub fn clean(&self, retention_minutes: u32) -> Option<u64> {
-        clean_at(&self.captures, retention_minutes, now_ms())
+    pub fn clean(&self, retention_minutes: u32, current: impl Fn() -> bool) -> Option<u64> {
+        let now = now_ms();
+        let mut next = clean_at(&self.captures, retention_minutes, now, false, &current);
+        if let Some(delay) = clean_at(
+            &self.root.join(CAPTURE_TEMP),
+            retention_minutes,
+            now,
+            true,
+            current,
+        ) {
+            schedule(&mut next, delay);
+        }
+        next
     }
 }
 
-fn write_png(output: impl Write, width: u32, height: u32, rgb: &[u8]) -> io::Result<()> {
-    let mut encoder = png::Encoder::new(output, width, height);
+fn write_png(output: impl Write, image: &Image) -> io::Result<()> {
+    let mut encoder = png::Encoder::new(output, image.width, image.height);
     encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
     encoder
         .add_text_chunk("Software".to_owned(), PNG_SOFTWARE.to_owned())
         .map_err(io::Error::other)?;
     let mut writer = encoder.write_header().map_err(io::Error::other)?;
-    writer.write_image_data(rgb).map_err(io::Error::other)?;
+    image.with_rows(|rows| {
+        let mut stream = writer
+            .stream_writer_with_size(64 * 1024)
+            .map_err(io::Error::other)?;
+        let mut rgb = vec![0; image.width as usize * 3];
+        for row in rows {
+            for (pixel, target) in row.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
+                target.copy_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+            }
+            stream.write_all(&rgb)?;
+        }
+        stream.finish().map_err(io::Error::other)
+    })?;
     writer.finish().map_err(io::Error::other)
 }
 
 fn is_capture(path: &Path) -> io::Result<bool> {
     let file = BufReader::new(File::open(path)?);
     match png::Decoder::new(file).read_info() {
-        Ok(reader) => Ok(reader
-            .info()
-            .uncompressed_latin1_text
-            .iter()
-            .any(|text| text.keyword == "Software" && text.text == PNG_SOFTWARE)),
+        Ok(reader) => Ok(has_software_marker(reader.info())),
         Err(png::DecodingError::IoError(error)) if error.kind() != io::ErrorKind::UnexpectedEof => {
             Err(error)
         }
         Err(_) => Ok(false),
     }
+}
+
+fn has_software_marker(info: &png::Info<'_>) -> bool {
+    info.uncompressed_latin1_text
+        .iter()
+        .any(|text| text.keyword == "Software" && text.text == PNG_SOFTWARE)
+}
+
+fn is_legacy_part(path: &Path) -> io::Result<bool> {
+    // The old writer put the marker immediately after IHDR, even if it was killed before IDAT.
+    let mut bytes = Vec::with_capacity(LEGACY_HEADER_BYTES as usize);
+    File::open(path)?
+        .take(LEGACY_HEADER_BYTES)
+        .read_to_end(&mut bytes)?;
+    let mut input = bytes.as_slice();
+    let mut decoder = png::StreamingDecoder::new();
+    while !input.is_empty() {
+        match decoder.update(input, None) {
+            Ok((_, png::Decoded::ChunkComplete(png::chunk::tEXt)))
+                if decoder.info().is_some_and(has_software_marker) =>
+            {
+                return Ok(true)
+            }
+            Ok((_, png::Decoded::ChunkBegin(_, png::chunk::IDAT | png::chunk::IEND))) | Err(_) => {
+                break
+            }
+            Ok((count, _)) => input = &input[count..],
+        }
+    }
+    Ok(false)
+}
+
+fn is_private_temp_dir(path: &Path) -> io::Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    Ok(metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0)
 }
 
 fn parse_settings(contents: &str) -> io::Result<Settings> {
@@ -237,12 +316,18 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn capture_timestamp(path: &Path) -> Option<u64> {
+fn remaining_ms(saved_at: u64, minutes: u32, now: u64) -> u64 {
+    saved_at
+        .saturating_add(u64::from(minutes) * 60_000)
+        .saturating_sub(now)
+}
+
+fn capture_timestamp(path: &Path, suffix: &str) -> Option<u64> {
     let name = path
         .file_name()?
         .to_str()?
         .strip_prefix("shot-")?
-        .strip_suffix(".png")?;
+        .strip_suffix(suffix)?;
     let mut fields = name.split('-');
     let timestamp = fields.next()?.parse().ok()?;
     fields.next()?.parse::<u32>().ok()?;
@@ -250,7 +335,21 @@ fn capture_timestamp(path: &Path) -> Option<u64> {
     fields.next().is_none().then_some(timestamp)
 }
 
-fn clean_at(directory: &Path, minutes: u32, now: u64) -> Option<u64> {
+fn clean_at(
+    directory: &Path,
+    minutes: u32,
+    now: u64,
+    temporary: bool,
+    current: impl Fn() -> bool,
+) -> Option<u64> {
+    if temporary {
+        match is_private_temp_dir(directory) {
+            Ok(true) => (),
+            Ok(false) => return None,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+            Err(_) => return Some(DELETE_RETRY_MS),
+        }
+    }
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
@@ -258,12 +357,21 @@ fn clean_at(directory: &Path, minutes: u32, now: u64) -> Option<u64> {
     };
     let mut next = None;
     for entry in entries {
+        if !current() {
+            return None;
+        }
         let Ok(entry) = entry else {
             schedule(&mut next, DELETE_RETRY_MS);
             continue;
         };
         let path = entry.path();
-        let Some(saved_at) = capture_timestamp(&path) else {
+        let part = capture_timestamp(&path, ".part");
+        let saved_at = if temporary {
+            part
+        } else {
+            part.or_else(|| capture_timestamp(&path, ".png"))
+        };
+        let Some(saved_at) = saved_at else {
             continue;
         };
         match entry.file_type() {
@@ -274,15 +382,18 @@ fn clean_at(directory: &Path, minutes: u32, now: u64) -> Option<u64> {
                 continue;
             }
         }
-        let remaining = saved_at
-            .saturating_add(u64::from(minutes) * 60_000)
-            .saturating_sub(now);
+        let remaining = remaining_ms(saved_at, minutes, now);
         if remaining > 0 {
             schedule(&mut next, remaining);
             continue;
         }
-        let result = is_capture(&path).and_then(|is_capture| {
-            if is_capture {
+        let marked = match (temporary, part.is_some()) {
+            (true, _) => Ok(true),
+            (false, true) => is_legacy_part(&path),
+            (false, false) => is_capture(&path),
+        };
+        let result = marked.and_then(|is_capture| {
+            if is_capture && current() {
                 fs::remove_file(&path)
             } else {
                 Ok(())
@@ -299,48 +410,62 @@ fn schedule(next: &mut Option<u64>, delay: u64) {
     *next = Some(next.map_or(delay, |current| current.min(delay)));
 }
 
-pub fn copy_path(owner: HWND, path: &Path) -> io::Result<()> {
+pub enum ClipboardError {
+    Busy(io::Error),
+    Failed(io::Error),
+}
+
+pub fn copy_path(owner: HWND, path: &Path) -> Result<(), ClipboardError> {
     let text = wide(path);
     unsafe {
-        let memory = GlobalAlloc(GMEM_MOVEABLE, text.len() * size_of::<u16>());
-        if memory.is_null() {
+        if OpenClipboard(owner) == 0 {
+            return Err(ClipboardError::Busy(io::Error::last_os_error()));
+        }
+        let result = set_clipboard_text(&text);
+        CloseClipboard();
+        result.map_err(ClipboardError::Failed)
+    }
+}
+
+unsafe fn set_clipboard_text(text: &[u16]) -> io::Result<()> {
+    let memory = GlobalAlloc(GMEM_MOVEABLE, size_of_val(text));
+    if memory.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let result = (|| {
+        let target = GlobalLock(memory).cast::<u16>();
+        if target.is_null() {
             return Err(io::Error::last_os_error());
         }
-        let result = (|| {
-            let target = GlobalLock(memory).cast::<u16>();
-            if target.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            target.copy_from_nonoverlapping(text.as_ptr(), text.len());
-            GlobalUnlock(memory);
-            for attempt in 0..6 {
-                if OpenClipboard(owner) != 0 {
-                    let result = if EmptyClipboard() != 0
-                        && !SetClipboardData(CF_UNICODETEXT, memory).is_null()
-                    {
-                        Ok(())
-                    } else {
-                        Err(io::Error::last_os_error())
-                    };
-                    CloseClipboard();
-                    return result;
-                }
-                if attempt < 5 {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
-            Err(io::Error::last_os_error())
-        })();
-        if result.is_err() {
-            GlobalFree(memory);
+        target.copy_from_nonoverlapping(text.as_ptr(), text.len());
+        GlobalUnlock(memory);
+        if EmptyClipboard() != 0 && !SetClipboardData(CF_UNICODETEXT, memory).is_null() {
+            return Ok(());
         }
-        result
+        Err(io::Error::last_os_error())
+    })();
+    if result.is_err() {
+        GlobalFree(memory);
     }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::background::{Background, Outcome, READY};
+
+    fn sample_image() -> Image {
+        Image::from_bgra(1, 1, vec![56, 34, 12, 0])
+    }
+    use std::{
+        ptr::{null, null_mut},
+        thread,
+        time::{Duration, Instant},
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, PeekMessageW, HWND_MESSAGE, MSG, PM_REMOVE,
+    };
 
     #[test]
     fn settings_require_recognized_hotkey_and_positive_retention() {
@@ -367,7 +492,7 @@ mod tests {
         let unmarked = directory.join("shot-100000-23-3.png");
         let fake_capture = directory.join("shot-100000-23-2.png");
         for path in [&expired, &current] {
-            write_png(File::create(path).unwrap(), 1, 1, &[12, 34, 56]).unwrap();
+            write_png(File::create(path).unwrap(), &sample_image()).unwrap();
         }
         fs::write(&unrelated, []).unwrap();
         let mut encoder = png::Encoder::new(File::create(&unmarked).unwrap(), 1, 1);
@@ -376,17 +501,70 @@ mod tests {
         writer.write_image_data(&[12, 34, 56]).unwrap();
         writer.finish().unwrap();
         fs::create_dir(&fake_capture).unwrap();
-        assert_eq!(clean_at(&directory, 2, 160_000), Some(60_000));
-        assert_eq!(clean_at(&directory, 1, 160_000), Some(1));
+        assert_eq!(
+            clean_at(&directory, 2, 160_000, false, || true),
+            Some(60_000)
+        );
+        assert_eq!(clean_at(&directory, 1, 160_000, false, || true), Some(1));
         assert!(!expired.exists());
         assert!(
             current.is_file() && unrelated.is_file() && unmarked.is_file() && fake_capture.is_dir()
         );
-        assert_eq!(clean_at(&directory, 1, 160_001), None);
+        assert_eq!(clean_at(&directory, 1, 160_001, false, || true), None);
         fs::remove_file(unrelated).unwrap();
         fs::remove_file(unmarked).unwrap();
         fs::remove_dir(fake_capture).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn cleanup_expires_incomplete_temporary_files_and_marked_legacy_files() {
+        let root = std::env::temp_dir().join(format!(
+            "CliScreenshot-parts-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let captures = root.join("captures");
+        let temporary = root.join(CAPTURE_TEMP);
+        fs::create_dir_all(&captures).unwrap();
+        fs::create_dir(&temporary).unwrap();
+        let partial = temporary.join("shot-100000-23-0.part");
+        let legacy = captures.join("shot-100000-23-1.part");
+        let unmarked = captures.join("shot-100000-23-2.part");
+        let recent = temporary.join("shot-100001-23-3.part");
+        let legacy_prefix = captures.join("shot-100000-23-4.part");
+        for path in [&partial, &unmarked, &recent] {
+            fs::write(path, b"unfinished").unwrap();
+        }
+        write_png(File::create(&legacy).unwrap(), &sample_image()).unwrap();
+        let legacy_bytes = fs::read(&legacy).unwrap();
+        let idat = legacy_bytes
+            .windows(4)
+            .position(|window| window == b"IDAT")
+            .unwrap();
+        fs::write(&legacy_prefix, &legacy_bytes[..idat - 4]).unwrap();
+
+        let active = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&partial)
+            .unwrap();
+        assert_eq!(clean_at(&temporary, 1, 160_000, true, || true), Some(1));
+        assert!(partial.exists());
+        drop(active);
+        assert_eq!(clean_at(&temporary, 1, 160_000, true, || true), Some(1));
+        assert_eq!(clean_at(&captures, 1, 160_000, false, || true), None);
+        assert!(!partial.exists());
+        assert!(!legacy.exists());
+        assert!(!legacy_prefix.exists());
+        assert!(recent.exists());
+        assert!(unmarked.exists());
+
+        fs::remove_file(recent).unwrap();
+        fs::remove_file(unmarked).unwrap();
+        fs::remove_dir(temporary).unwrap();
+        fs::remove_dir(captures).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]
@@ -399,7 +577,10 @@ mod tests {
             captures: captures.clone(),
         };
         let expected = [10, 20, 30, 40, 50, 60];
-        let path = storage.save_png(2, 1, &expected).unwrap();
+        let path = storage
+            .save_png(&Image::from_bgra(2, 1, vec![30, 20, 10, 0, 60, 50, 40, 0]))
+            .unwrap()
+            .path;
         let mut reader = png::Decoder::new(BufReader::new(File::open(&path).unwrap()))
             .read_info()
             .unwrap();
@@ -422,7 +603,92 @@ mod tests {
         drop(reader);
         fs::remove_file(path).unwrap();
         fs::remove_file(root.join("settings.ini")).unwrap();
+        fs::remove_dir(root.join(CAPTURE_TEMP)).unwrap();
         fs::remove_dir(captures).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn background_reports_a_saved_image_and_schedules_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "CliScreenshot-background-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let captures = root.join("captures");
+        fs::create_dir_all(&captures).unwrap();
+        let expired = captures.join("shot-100000-23-0.png");
+        write_png(File::create(&expired).unwrap(), &sample_image()).unwrap();
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                null_mut(),
+                null_mut(),
+                null(),
+            )
+        };
+        assert!(!hwnd.is_null());
+        let mut background = Background::start(
+            hwnd,
+            Storage {
+                root: root.clone(),
+                captures: captures.clone(),
+            },
+            Some(1),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            background.save(sample_image()).unwrap();
+        }
+        assert_eq!(background.save_budget(), 0);
+        assert_eq!(
+            background.save(sample_image()).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        background.clean().unwrap();
+        let mut receive = || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut message = MSG::default();
+            loop {
+                if unsafe { PeekMessageW(&mut message, hwnd, READY, READY, PM_REMOVE) } != 0 {
+                    return background.receive().unwrap();
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "background job did not notify the window"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let saved = (0..3)
+            .map(|_| {
+                let Outcome::Saved(Ok(saved)) = receive() else {
+                    panic!("expected saved PNG")
+                };
+                assert!(saved.expires_in(1) <= Duration::from_secs(60));
+                assert!(is_capture(&saved.path).unwrap());
+                saved.path
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(receive(), Outcome::Cleaned(Some(_))));
+        assert!(!background.is_saving());
+        assert_eq!(background.save_budget(), usize::MAX);
+        assert!(!expired.exists());
+        drop(background);
+        unsafe { DestroyWindow(hwnd) };
+        for path in saved {
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_dir(captures).unwrap();
+        fs::remove_dir(root.join(CAPTURE_TEMP)).unwrap();
         fs::remove_dir(root).unwrap();
     }
 }
