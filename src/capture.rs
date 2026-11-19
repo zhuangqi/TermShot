@@ -19,15 +19,15 @@ mod strokes;
 mod text;
 mod toolbar;
 mod windows;
-use annotations::{Change, Handle, Mark, Tool};
+use annotations::{Annotations, Mark, MarkDrag, Tool};
 use render::{update_rectangles, Bitmap, Font};
-use text::{TextInput, TextMark};
+use text::TextEditor;
 use toolbar::Button;
 
 const CLASS: &str = "TermShot.Overlay";
-const TEXT_FINISHED: u32 = WM_APP + 10;
 const CLICK_TIMER: usize = 1;
 const INK: u32 = rgb(231, 43, 52);
+const SELECTION_BORDER: COLORREF = rgb(72, 220, 134);
 
 thread_local! {
     static EDITOR: RefCell<Option<Editor>> = const { RefCell::new(None) };
@@ -216,18 +216,11 @@ impl Area {
 }
 
 enum DragKind {
-    Region {
-        box_started: bool,
-    },
+    Region { box_started: bool },
     Draw(Tool),
     Pen(strokes::LivePen),
-    Mark {
-        index: usize,
-        handle: Option<Handle>,
-    },
-    Toolbar {
-        origin: Point,
-    },
+    Mark(MarkDrag),
+    Toolbar { origin: Point },
 }
 
 struct Drag {
@@ -271,18 +264,6 @@ impl Drag {
             _ => None,
         }
     }
-
-    fn paint_bounds(&self, crop: Area, color: COLORREF) -> Option<Area> {
-        if let DragKind::Pen(stroke) = &self.kind {
-            return stroke.paint_bounds();
-        }
-        self.drawn_mark(crop, color).map(|mark| mark.paint_bounds())
-    }
-}
-
-enum ClickAction {
-    Button(Button),
-    Erase(usize),
 }
 
 struct Editor {
@@ -294,7 +275,6 @@ struct Editor {
     windows: Vec<Area>,
     original: Bitmap,
     frame: Option<Bitmap>,
-    font: Option<Font>,
     antialias: OnceCell<Option<strokes::Antialias>>,
     selection: Option<Area>,
     toolbar: Option<Point>,
@@ -302,15 +282,12 @@ struct Editor {
     hovered: Option<Button>,
     tooltip: Option<toolbar::Tooltip>,
     pointer: Option<Point>,
-    pending_click: Option<ClickAction>,
+    pending_click: Option<Button>,
     drag: Option<Drag>,
     tool: Tool,
     color: COLORREF,
-    marks: Vec<Mark>,
-    selected_mark: Option<usize>,
-    undo: Vec<Change>,
-    redo: Vec<Change>,
-    text: Option<TextInput>,
+    annotations: Annotations,
+    text: TextEditor,
     finished: Option<bool>,
     save_busy: bool,
 }
@@ -377,7 +354,6 @@ pub fn start(instance: HINSTANCE, owner: HWND) -> io::Result<()> {
                 windows,
                 original,
                 frame: Some(frame),
-                font: None,
                 antialias: OnceCell::new(),
                 selection: None,
                 toolbar: None,
@@ -389,11 +365,8 @@ pub fn start(instance: HINSTANCE, owner: HWND) -> io::Result<()> {
                 drag: None,
                 tool: Tool::Rectangle,
                 color: INK,
-                marks: Vec::new(),
-                selected_mark: None,
-                undo: Vec::new(),
-                redo: Vec::new(),
-                text: None,
+                annotations: Annotations::default(),
+                text: TextEditor::default(),
                 finished: None,
                 save_busy: false,
             }))
@@ -450,6 +423,7 @@ pub fn complete(save_budget: usize) -> io::Result<Option<Image>> {
     }
     unsafe {
         let was_foreground = GetForegroundWindow() == editor.hwnd;
+        editor.text.shutdown();
         DestroyWindow(editor.hwnd);
         if was_foreground && !editor.previous.is_null() && IsWindow(editor.previous) != 0 {
             SetForegroundWindow(editor.previous);
@@ -463,33 +437,9 @@ pub fn complete(save_budget: usize) -> io::Result<Option<Image>> {
 }
 
 pub fn handle_edit_key(message: &MSG) -> bool {
-    if message.message != WM_KEYDOWN || !matches!(message.wParam as u16, VK_RETURN | VK_ESCAPE) {
-        return false;
-    }
-    let overlay = EDITOR.with(|slot| {
-        let state = slot.borrow();
-        let editor = state.as_ref()?;
-        (editor.text.as_ref()?.hwnd == message.hwnd).then_some(editor.hwnd)
-    });
-    let Some(overlay) = overlay else { return false };
-    unsafe {
-        // Let the native edit control finish an IME composition before interpreting Enter or Escape.
-        let context = ImmGetContext(message.hwnd);
-        if !context.is_null() {
-            let composing = ImmGetCompositionStringW(context, GCS_COMPSTR, null_mut(), 0) > 0;
-            ImmReleaseContext(message.hwnd, context);
-            if composing {
-                return false;
-            }
-        }
-        SendMessageW(
-            overlay,
-            TEXT_FINISHED,
-            usize::from(message.wParam as u16 == VK_RETURN),
-            0,
-        );
-    }
-    true
+    text::handle_finish_key(message, |source| {
+        EDITOR.with(|slot| slot.borrow().as_ref()?.text.overlay_for(source))
+    })
 }
 
 unsafe extern "system" fn window_proc(
@@ -516,6 +466,7 @@ unsafe extern "system" fn window_proc(
         WM_LBUTTONUP => edit(|editor| editor.mouse_up(editor.pointer(lparam))),
         WM_LBUTTONDBLCLK => edit(|editor| editor.finish(true)),
         WM_TIMER if wparam == CLICK_TIMER => edit(Editor::apply_pending_click),
+        WM_TIMER if wparam == text::CARET_TIMER => edit(|editor| editor.text.blink()),
         WM_MOUSEHOVER => edit(|editor| editor.show_tooltip(editor.pointer(lparam))),
         WM_MOUSELEAVE => edit(|editor| {
             editor.hide_tooltip();
@@ -538,32 +489,18 @@ unsafe extern "system" fn window_proc(
                 lparam & !(ISC_SHOWUICOMPOSITIONWINDOW as isize),
             );
         }
-        TEXT_FINISHED => edit(|editor| {
+        text::FINISHED => edit(|editor| {
             editor.close_text(wparam != 0);
         }),
-        text::UPDATED => edit(|editor| {
-            if let (Some(input), Some(crop), Some(font)) =
-                (&mut editor.text, editor.selection, editor.font.as_ref())
-            {
-                if input.hwnd == wparam as HWND {
-                    input.refresh(hwnd, editor.original.dc, font, crop);
-                    editor.invalidate_draft();
-                }
-            }
-        }),
+        text::UPDATED => edit(|editor| editor.text.refresh(editor.original.dc, wparam as HWND)),
         text::IME_POSITION if lparam != 0 => {
             let mut handled = false;
             with_editor(|editor| {
-                if let (Some(input), Some(crop)) = (&editor.text, editor.selection) {
-                    if input.hwnd == wparam as HWND {
-                        input.ime_position(
-                            crop,
-                            editor.desktop,
-                            &mut *(lparam as *mut IMECHARPOSITION),
-                        );
-                        handled = true;
-                    }
-                }
+                handled = editor.text.ime_position(
+                    wparam as HWND,
+                    editor.desktop,
+                    &mut *(lparam as *mut IMECHARPOSITION),
+                );
             });
             return LRESULT::from(handled);
         }
@@ -586,10 +523,13 @@ fn with_editor(action: impl FnOnce(&mut Editor)) {
 
 fn edit(action: impl FnOnce(&mut Editor)) {
     with_editor(|editor| {
-        let before = editor.preview();
+        let before = editor.preview_snapshot();
         action(editor);
         if editor.finished.is_none() {
-            editor.invalidate_changes(before);
+            let hwnd = editor.hwnd;
+            editor.repaint_changes(before, |area| unsafe {
+                InvalidateRect(hwnd, &area.rect(), 0);
+            });
         }
     });
 }
@@ -627,32 +567,17 @@ impl Editor {
             return;
         }
         let local = crop.local(point);
-        if let Some(input) = &self.text {
-            if input.draft.bounds().contains(local) {
-                input.set_caret(local);
-                return;
-            }
-            if !self.close_text(true) {
-                return;
-            }
+        if self.text.click(local) || !self.close_text(true) {
+            return;
         }
 
         match self.tool {
             Tool::Select => {
-                let handle = self.handle_at(local, crop.local_bounds());
-                if handle.is_none() {
-                    self.selected_mark = self.mark_at(local);
-                }
-                if let Some(index) = self.selected_mark {
-                    self.begin_drag(point, DragKind::Mark { index, handle });
+                if let Some(drag) = self.annotations.begin_transform(local, crop.local_bounds()) {
+                    self.begin_drag(point, DragKind::Mark(drag));
                 }
             }
-            Tool::Eraser => {
-                if let Some(index) = self.mark_at(local) {
-                    self.defer_click(ClickAction::Erase(index));
-                }
-            }
-            Tool::Text => self.open_text(crop, local),
+            Tool::Text => self.text.open(self.hwnd, self.original.dc, crop, local),
             Tool::Pen => self.begin_drag(point, DragKind::Pen(strokes::LivePen::new(local))),
             tool => self.begin_drag(point, DragKind::Draw(tool)),
         }
@@ -726,27 +651,6 @@ impl Editor {
         }
     }
 
-    fn mark_at(&self, point: Point) -> Option<usize> {
-        self.marks
-            .iter()
-            .rposition(|mark| mark.hit(point))
-            .or_else(|| {
-                self.selected_mark
-                    .filter(|&index| self.marks[index].bounds().contains(point))
-            })
-            .or_else(|| {
-                self.marks
-                    .iter()
-                    .rposition(|mark| mark.contains_rectangle(point))
-            })
-    }
-
-    fn handle_at(&self, point: Point, crop: Area) -> Option<Handle> {
-        self.selected_mark
-            .and_then(|index| self.marks.get(index))
-            .and_then(|mark| mark.handle_at(point, crop))
-    }
-
     fn window_at(&self, point: Point) -> Option<Area> {
         if self.selection.is_some() {
             return None;
@@ -760,11 +664,8 @@ impl Editor {
     fn cursor_at(&self, point: Option<Point>) -> *const u16 {
         if let Some(drag) = &self.drag {
             return match drag.kind {
-                DragKind::Toolbar { .. } | DragKind::Mark { handle: None, .. } => IDC_SIZEALL,
-                DragKind::Mark {
-                    handle: Some(handle),
-                    ..
-                } => handle.cursor(),
+                DragKind::Toolbar { .. } => IDC_SIZEALL,
+                DragKind::Mark(mark) => mark.cursor(),
                 _ => IDC_CROSS,
             };
         }
@@ -783,14 +684,7 @@ impl Editor {
                     return IDC_IBEAM;
                 }
                 if self.tool == Tool::Select {
-                    if let Some(handle) = self.handle_at(local, crop.local_bounds()) {
-                        return handle.cursor();
-                    }
-                    return if self.mark_at(local).is_some() {
-                        IDC_SIZEALL
-                    } else {
-                        IDC_ARROW
-                    };
+                    return self.annotations.cursor_at(local, crop.local_bounds());
                 }
             }
         }
@@ -807,17 +701,6 @@ impl Editor {
             DragKind::Region { box_started: false } => self.window_at(drag.start),
             _ => None,
         }
-    }
-
-    fn transformed_mark(&self, crop: Area, drag: &Drag) -> Option<(usize, Mark)> {
-        let DragKind::Mark { index, handle } = drag.kind else {
-            return None;
-        };
-        let mark = self
-            .marks
-            .get(index)?
-            .transform(handle, drag.delta(), crop.local_bounds())?;
-        Some((index, mark))
     }
 
     fn mouse_up(&mut self, point: Point) {
@@ -846,30 +729,24 @@ impl Editor {
             }
             DragKind::Pen(stroke) => {
                 if stroke.points.len() > 1 {
-                    self.add_mark(Mark::pen(stroke.points, self.color));
+                    self.annotations.add(Mark::pen(stroke.points, self.color));
                 }
             }
-            _ => {
+            DragKind::Draw(_) => {
+                if let Some(mark) = self
+                    .selection
+                    .and_then(|crop| drag.drawn_mark(crop, self.color))
+                {
+                    self.annotations.add(mark);
+                }
+            }
+            DragKind::Mark(mark) => {
                 if let Some(crop) = self.selection {
-                    if let Some(mark) = drag.drawn_mark(crop, self.color) {
-                        self.add_mark(mark);
-                    }
-                    if let Some((index, mark)) = self.transformed_mark(crop, &drag) {
-                        self.change(Change::Replace(index, mark));
-                    }
+                    self.annotations
+                        .finish_transform(mark, drag.delta(), crop.local_bounds());
                 }
             }
         }
-    }
-
-    fn add_mark(&mut self, mark: Mark) {
-        self.change(Change::Insert(self.marks.len(), mark));
-    }
-
-    fn change(&mut self, change: Change) {
-        let inverse = self.apply_change(change);
-        self.undo.push(inverse);
-        self.redo.clear();
     }
 
     fn discard_drag(&mut self) {
@@ -880,40 +757,10 @@ impl Editor {
 
     fn history(&mut self, redo: bool) {
         self.discard_drag();
-        let change = if redo {
-            self.redo.pop()
+        if redo {
+            self.annotations.redo();
         } else {
-            self.undo.pop()
-        };
-        if let Some(change) = change {
-            let inverse = self.apply_change(change);
-            if redo {
-                self.undo.push(inverse);
-            } else {
-                self.redo.push(inverse);
-            }
-            self.selected_mark = None;
-        }
-    }
-
-    fn apply_change(&mut self, change: Change) -> Change {
-        let (inverse, before, after) = change.apply(&mut self.marks);
-        self.invalidate_marks(before, after);
-        inverse
-    }
-
-    fn invalidate_marks(&self, before: Option<Area>, after: Option<Area>) {
-        if let Some(crop) = self.selection {
-            self.invalidate(before.and_then(|area| area.offset(crop.origin()).intersection(crop)));
-            self.invalidate(after.and_then(|area| area.offset(crop.origin()).intersection(crop)));
-        }
-    }
-
-    fn erase(&mut self, index: usize) {
-        self.discard_drag();
-        if index < self.marks.len() {
-            self.change(Change::Remove(index));
-            self.selected_mark = None;
+            self.annotations.undo();
         }
     }
 
@@ -928,8 +775,9 @@ impl Editor {
             VK_ESCAPE => self.finish(false),
             VK_RETURN => self.finish(true),
             VK_DELETE => {
-                if let Some(index) = self.selected_mark {
-                    self.erase(index);
+                if self.annotations.selected().is_some() {
+                    self.discard_drag();
+                    self.annotations.delete_selected();
                 }
             }
             0x5a if control => self.history(unsafe { GetKeyState(i32::from(VK_SHIFT)) < 0 }),
@@ -954,61 +802,52 @@ impl Editor {
                 self.begin_drag(point, DragKind::Toolbar { origin });
             }
         } else if matches!(button, Button::Cancel | Button::Undo | Button::Redo) {
-            self.defer_click(ClickAction::Button(button));
+            self.defer_click(button);
         } else {
-            self.perform_click(ClickAction::Button(button));
+            self.perform_click(button);
         }
     }
 
-    fn perform_click(&mut self, action: ClickAction) {
-        match action {
-            ClickAction::Erase(index) => self.erase(index),
-            ClickAction::Button(button) => match button {
-                Button::Tool(tool) => {
-                    self.tool = tool;
-                    if tool != Tool::Select {
-                        self.selected_mark = None;
-                    }
+    fn perform_click(&mut self, button: Button) {
+        match button {
+            Button::Tool(tool) => {
+                self.tool = tool;
+                if tool != Tool::Select {
+                    self.annotations.clear_selection();
                 }
-                Button::Palette => self.palette_open = !self.palette_open,
-                Button::Swatch(color) => {
-                    self.color = color;
-                    self.palette_open = false;
-                    if let Some(index) = self.selected_mark {
-                        let mut mark = self.marks[index].clone();
-                        if color != mark.color {
-                            mark.color = color;
-                            self.change(Change::Replace(index, mark));
-                        }
-                    }
-                }
-                Button::Undo => self.history(false),
-                Button::Redo => self.history(true),
-                Button::Cancel => self.finish(false),
-                Button::Save => self.finish(true),
-                Button::Grip => {}
-            },
+            }
+            Button::Palette => self.palette_open = !self.palette_open,
+            Button::Swatch(color) => {
+                self.color = color;
+                self.palette_open = false;
+                self.annotations.recolor_selected(color);
+            }
+            Button::Undo => self.history(false),
+            Button::Redo => self.history(true),
+            Button::Cancel => self.finish(false),
+            Button::Save => self.finish(true),
+            Button::Grip => {}
         }
     }
 
-    fn defer_click(&mut self, action: ClickAction) {
+    fn defer_click(&mut self, button: Button) {
         // A double-click takes priority over a first click that could discard work.
         if unsafe { SetTimer(self.hwnd, CLICK_TIMER, GetDoubleClickTime(), None) } != 0 {
-            self.pending_click = Some(action);
+            self.pending_click = Some(button);
         } else {
-            self.perform_click(action);
+            self.perform_click(button);
         }
     }
 
-    fn take_pending_click(&mut self) -> Option<ClickAction> {
-        let action = self.pending_click.take()?;
+    fn take_pending_click(&mut self) -> Option<Button> {
+        let button = self.pending_click.take()?;
         unsafe { KillTimer(self.hwnd, CLICK_TIMER) };
-        Some(action)
+        Some(button)
     }
 
     fn apply_pending_click(&mut self) {
-        if let Some(action) = self.take_pending_click() {
-            self.perform_click(action);
+        if let Some(button) = self.take_pending_click() {
+            self.perform_click(button);
         }
     }
 
@@ -1025,43 +864,22 @@ impl Editor {
         self.take_pending_click();
         self.hide_tooltip();
         self.finished = Some(save);
+        self.text.stop_blink();
         unsafe { PostMessageW(self.owner, WM_CAPTURE_FINISHED, 0, 0) };
     }
 
-    fn open_text(&mut self, crop: Area, anchor: Point) {
-        if self.font.is_none() {
-            self.font = Font::new(self.original.dc).ok();
-        }
-        let Some(font) = self.font.as_ref() else {
-            return;
-        };
-        self.text = TextInput::new(self.hwnd, self.original.dc, font, crop, anchor);
-        if let Some(input) = self.text.as_mut() {
-            unsafe { SetFocus(input.hwnd) };
-            input.refresh(self.hwnd, self.original.dc, font, crop);
-        }
-    }
-
     fn close_text(&mut self, keep: bool) -> bool {
-        let Some(input) = &mut self.text else {
+        if !self.text.is_open() {
             return true;
-        };
-        let hwnd = input.hwnd;
-        if let (Some(crop), Some(font)) = (self.selection.filter(|_| keep), self.font.as_ref()) {
-            if let Some(mark) = input.finish(self.original.dc, font, crop) {
-                if !mark.fits(crop) {
-                    input.refresh(self.hwnd, self.original.dc, font, crop);
-                    unsafe { SetFocus(hwnd) };
-                    self.invalidate_draft();
-                    return false;
-                }
-                self.add_mark(Mark::text(mark, self.color));
-            }
         }
-        self.text = None;
-        unsafe {
-            DestroyWindow(hwnd);
-            SetFocus(self.hwnd);
+        if keep {
+            match self.text.commit(self.original.dc) {
+                Ok(Some(mark)) => self.annotations.add(Mark::text(mark, self.color)),
+                Ok(None) => {}
+                Err(_) => return false,
+            }
+        } else {
+            self.text.cancel();
         }
         self.set_cursor(self.pointer);
         true
@@ -1124,6 +942,7 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
+    use super::text::{TextMark, CARET_TIMER};
     use super::*;
 
     #[test]
@@ -1160,8 +979,8 @@ mod tests {
             monitors: vec![desktop],
             windows: Vec::new(),
             original: Bitmap::new(desktop.width(), desktop.height()).unwrap(),
-            font: Some(Font::new(frame.dc).unwrap()),
             antialias: OnceCell::new(),
+            text: TextEditor::with_font(Font::new(frame.dc).unwrap()),
             frame: Some(frame),
             selection: Some(selection),
             toolbar: None,
@@ -1173,14 +992,38 @@ mod tests {
             drag: None,
             tool: Tool::Rectangle,
             color: INK,
-            marks: Vec::new(),
-            selected_mark: None,
-            undo: Vec::new(),
-            redo: Vec::new(),
-            text: None,
+            annotations: Annotations::default(),
             finished: None,
             save_busy: false,
         }
+    }
+
+    fn editor_with_overlay() -> Editor {
+        use std::sync::Once;
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+
+        static REGISTER: Once = Once::new();
+        let mut editor = editor_with_selection();
+        let instance = unsafe { GetModuleHandleW(null()) };
+        REGISTER.call_once(|| register(instance).unwrap());
+        editor.hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                wide(CLASS).as_ptr(),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                editor.desktop.width(),
+                editor.desktop.height(),
+                null_mut(),
+                null_mut(),
+                instance,
+                null(),
+            )
+        };
+        assert!(!editor.hwnd.is_null());
+        editor
     }
 
     #[test]
@@ -1217,52 +1060,64 @@ mod tests {
         assert_eq!(editor.tool, Tool::Rectangle);
         editor.mouse_down(start);
         editor.mouse_up(end);
-        let original = editor.marks[0].bounds();
+        let original = editor.annotations.marks()[0].bounds();
         assert_eq!(editor.tool, Tool::Rectangle);
         editor.mouse_down(Point { x: 95, y: 45 });
         editor.mouse_up(Point { x: 120, y: 75 });
-        assert_eq!(editor.marks.len(), 2);
-        assert_eq!(editor.selected_mark, None);
+        assert_eq!(editor.annotations.marks().len(), 2);
+        assert_eq!(editor.annotations.selected().map(Mark::bounds), None);
 
-        editor.perform_click(ClickAction::Button(Button::Tool(Tool::Select)));
+        editor.perform_click(Button::Tool(Tool::Select));
         let center = Point { x: 55, y: 58 };
         editor.mouse_down(center);
         editor.mouse_up(center);
-        assert_eq!(editor.selected_mark, Some(0));
+        assert_eq!(
+            editor.annotations.selected().map(Mark::bounds),
+            Some(original)
+        );
 
         let east = Point { x: 72, y: 58 };
         assert_eq!(editor.cursor_at(Some(east)), IDC_SIZEWE);
         editor.mouse_down(east);
         editor.mouse_up(east + Point { x: 12, y: 0 });
-        let resized = editor.marks[0].bounds();
+        let resized = editor.annotations.marks()[0].bounds();
         assert_eq!(resized.width(), original.width() + 12);
         assert_eq!(resized.height(), original.height());
         let delta = Point { x: 7, y: 9 };
         editor.mouse_down(center);
         editor.mouse_up(center + delta);
-        assert_eq!(editor.marks[0].bounds(), resized.offset(delta));
+        assert_eq!(
+            editor.annotations.marks()[0].bounds(),
+            resized.offset(delta)
+        );
         editor.history(false);
-        assert_eq!(editor.marks[0].bounds(), resized);
+        assert_eq!(editor.annotations.marks()[0].bounds(), resized);
         editor.history(true);
-        assert_eq!(editor.marks[0].bounds(), resized.offset(delta));
+        assert_eq!(
+            editor.annotations.marks()[0].bounds(),
+            resized.offset(delta)
+        );
 
         let mut editor = editor_with_selection();
         editor.tool = Tool::Arrow;
         editor.mouse_down(start);
         editor.mouse_up(end);
         assert_eq!(editor.tool, Tool::Arrow);
-        editor.perform_click(ClickAction::Button(Button::Tool(Tool::Select)));
+        editor.perform_click(Button::Tool(Tool::Select));
         editor.mouse_down(start);
         editor.mouse_up(start);
         editor.mouse_down(end);
         editor.mouse_up(end + Point { x: 10, y: -12 });
-        let changed = editor.marks[0].bounds();
+        let changed = editor.annotations.marks()[0].bounds();
         assert_eq!(changed.right, 73);
         assert_eq!(changed.bottom, 44);
         let middle = Point { x: 56, y: 53 };
         editor.mouse_down(middle);
         editor.mouse_up(middle + delta);
-        assert_eq!(editor.marks[0].bounds(), changed.offset(delta));
+        assert_eq!(
+            editor.annotations.marks()[0].bounds(),
+            changed.offset(delta)
+        );
 
         let mut editor = editor_with_selection();
         editor.tool = Tool::Pen;
@@ -1271,22 +1126,25 @@ mod tests {
         editor.mouse_move(bend);
         editor.mouse_up(end);
         assert_eq!(editor.tool, Tool::Pen);
-        editor.perform_click(ClickAction::Button(Button::Tool(Tool::Select)));
+        editor.perform_click(Button::Tool(Tool::Select));
         editor.mouse_down(bend);
         editor.mouse_up(bend);
-        let original = editor.marks[0].bounds();
+        let original = editor.annotations.marks()[0].bounds();
         let south = Point { x: 51, y: 75 };
         assert_eq!(editor.cursor_at(Some(south)), IDC_SIZENS);
         editor.mouse_down(south);
         editor.mouse_up(south + Point { x: 0, y: 10 });
-        assert_eq!(editor.marks[0].bounds().height(), original.height() + 10);
+        assert_eq!(
+            editor.annotations.marks()[0].bounds().height(),
+            original.height() + 10
+        );
         let ink = rgb(17, 120, 250);
-        editor.perform_click(ClickAction::Button(Button::Swatch(ink)));
-        assert_eq!(editor.marks[0].color, ink);
-        editor.erase(0);
-        assert!(editor.marks.is_empty());
+        editor.perform_click(Button::Swatch(ink));
+        assert_eq!(editor.annotations.marks()[0].color, ink);
+        editor.key_down(VK_DELETE);
+        assert!(editor.annotations.marks().is_empty());
         editor.history(false);
-        assert_eq!(editor.marks[0].color, ink);
+        assert_eq!(editor.annotations.marks()[0].color, ink);
     }
 
     #[test]
@@ -1298,7 +1156,7 @@ mod tests {
         for pixel in editor.original.bytes_mut().chunks_exact_mut(4) {
             pixel.copy_from_slice(&[background[2], background[1], background[0], 0]);
         }
-        editor.marks = vec![
+        for mark in [
             Mark::rectangle(
                 Area {
                     left: 8,
@@ -1312,14 +1170,16 @@ mod tests {
             Mark::text(
                 TextMark::new(
                     editor.original.dc,
-                    editor.font.as_ref().unwrap(),
+                    editor.text.font().unwrap(),
                     selection,
                     Point { x: 8, y: 45 },
                     "中文".encode_utf16().collect(),
                 ),
                 INK,
             ),
-        ];
+        ] {
+            editor.annotations.add(mark);
+        }
         let image = editor.render_annotated_image(selection).unwrap();
         assert_eq!((image.width, image.height), (120, 80));
         let rgb = image.rgb();
@@ -1359,7 +1219,7 @@ mod tests {
         editor.mouse_down(grab);
         editor.mouse_move(drop);
         editor.mouse_up(drop);
-        let moved = &editor.marks[2];
+        let moved = &editor.annotations.marks()[2];
         assert_eq!(moved.bounds().right, selection.width());
         assert_eq!(moved.bounds().bottom, selection.height());
         assert_eq!(editor.cursor_at(Some(grab)), IDC_ARROW);
@@ -1368,16 +1228,12 @@ mod tests {
         let image = image.rgb();
         assert_eq!(image[old_pixel..old_pixel + 3], background);
 
-        use annotations::Edge::First;
-        let scaled = editor.marks[2]
-            .transform(
-                Some(Handle::Frame(First, First)),
-                Point { x: -16, y: -10 },
-                selection.local_bounds(),
-            )
-            .unwrap();
-        let bounds = scaled.bounds();
-        editor.change(Change::Replace(2, scaled));
+        let corner =
+            moved.controls_bounds(selection.local_bounds()).origin() + Point { x: 4, y: 4 };
+        let corner = corner + selection.origin();
+        editor.mouse_down(corner);
+        editor.mouse_up(corner + Point { x: -16, y: -10 });
+        let bounds = editor.annotations.marks()[2].bounds();
         let scaled_image = editor.render_annotated_image(selection).unwrap().rgb();
         let red_pixels = |image: &[u8]| {
             (40..80)
@@ -1393,6 +1249,46 @@ mod tests {
     }
 
     #[test]
+    fn annotation_handles_contrast_with_light_and_dark_backgrounds() {
+        let editor = editor_with_selection();
+        let crop = editor.selection.unwrap().local_bounds();
+        let start = Point { x: 20, y: 15 };
+        let end = Point { x: 85, y: 45 };
+        let marks = [
+            Mark::rectangle(Area::from_drag(start, end).unwrap(), INK),
+            Mark::arrow(start, end, INK),
+            Mark::pen(vec![start, end], INK),
+            Mark::text(
+                TextMark::new(
+                    editor.original.dc,
+                    editor.text.font().unwrap(),
+                    crop,
+                    start,
+                    "标注".encode_utf16().collect(),
+                ),
+                INK,
+            ),
+        ];
+        for mark in marks {
+            let frame = Bitmap::new(crop.width(), crop.height()).unwrap();
+            let corner = mark.controls_bounds(crop).origin();
+            for background in [0, crate::appearance::WHITE] {
+                unsafe {
+                    crate::appearance::fill(frame.dc, &crop.rect(), background);
+                    mark.paint_controls(frame.dc, crop);
+                    let outline = GetPixel(frame.dc, corner.x, corner.y);
+                    assert_ne!(outline, crate::appearance::WHITE);
+                    assert_ne!(outline, background);
+                    assert_eq!(
+                        GetPixel(frame.dc, corner.x + 4, corner.y + 4),
+                        crate::appearance::WHITE
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn diagonal_strokes_blend_edges_in_preview_and_export() {
         let mut editor = editor_with_selection();
         assert!(editor.antialias().is_some());
@@ -1401,7 +1297,7 @@ mod tests {
         for pixel in editor.original.bytes_mut().chunks_exact_mut(4) {
             pixel.copy_from_slice(&[background[2], background[1], background[0], 0]);
         }
-        editor.marks = vec![
+        for mark in [
             Mark::arrow(Point { x: 0, y: 1 }, Point { x: 52, y: 33 }, INK),
             Mark::pen(
                 vec![
@@ -1414,7 +1310,9 @@ mod tests {
                 ],
                 INK,
             ),
-        ];
+        ] {
+            editor.annotations.add(mark);
+        }
         let image = editor.render_annotated_image(crop).unwrap();
         let rgb = image.rgb();
         let blended = |from, to| {
@@ -1462,7 +1360,7 @@ mod tests {
             editor.mouse_move(drawing_end);
             if transform {
                 editor.mouse_up(drawing_end);
-                editor.perform_click(ClickAction::Button(Button::Tool(Tool::Select)));
+                editor.perform_click(Button::Tool(Tool::Select));
                 editor.mouse_down(move_start);
                 editor.mouse_move(move_end);
             }
@@ -1497,7 +1395,7 @@ mod tests {
                 pixel.copy_from_slice(&[(index % stride) as u8, (index / stride) as u8, 121, 0]);
             }
             if annotated {
-                editor.marks.push(Mark::arrow(
+                editor.annotations.add(Mark::arrow(
                     Point { x: 0, y: 0 },
                     Point { x: 31, y: 21 },
                     INK,
@@ -1528,7 +1426,7 @@ mod tests {
     #[test]
     fn busy_save_keeps_the_selection_and_annotations_available() {
         let mut editor = editor_with_selection();
-        editor.add_mark(Mark::arrow(
+        editor.annotations.add(Mark::arrow(
             Point { x: 3, y: 5 },
             Point { x: 28, y: 10 },
             INK,
@@ -1538,7 +1436,7 @@ mod tests {
         assert!(complete(0).unwrap().is_none());
         with_editor(|editor| {
             assert!(editor.save_busy);
-            assert_eq!(editor.marks.len(), 1);
+            assert_eq!(editor.annotations.marks().len(), 1);
             editor.finish(true);
         });
         assert!(complete(usize::MAX).unwrap().is_some());
@@ -1564,14 +1462,17 @@ mod tests {
             }))
             .collect::<Vec<_>>();
         editor.mouse_down(crop.origin() + points[0]);
-        for (previous, &point) in points.iter().enumerate().skip(1) {
+        for &point in points.iter().skip(1) {
+            let before = editor.preview_snapshot();
             editor.mouse_move(crop.origin() + point);
-            let dirty = editor.pen_damage(previous).unwrap();
-            assert!(dirty.width() <= 8);
-            editor.paint(partial.dc, &[dirty.rect()]);
+            let mut dirty = Vec::new();
+            editor.repaint_changes(before, |area| dirty.push(area));
+            assert_eq!(dirty.len(), 1);
+            assert!(dirty[0].width() <= 8);
+            editor.paint(partial.dc, &[dirty[0].rect()]);
         }
         editor.discard_drag();
-        editor.marks.push(Mark::pen(points, editor.color));
+        editor.annotations.add(Mark::pen(points, editor.color));
         editor.frame = Some(Bitmap::new(desktop.width(), desktop.height()).unwrap());
         let full = Bitmap::new(desktop.width(), desktop.height()).unwrap();
         editor.paint(full.dc, &[desktop.rect()]);
@@ -1589,7 +1490,7 @@ mod tests {
         let desktop = editor.desktop.local_bounds();
         editor.toolbar = Some(Point { x: 20, y: 102 });
         editor.palette_open = true;
-        editor.add_mark(Mark::arrow(
+        editor.annotations.add(Mark::arrow(
             Point { x: 4, y: 15 },
             Point { x: 102, y: 60 },
             INK,
@@ -1632,40 +1533,171 @@ mod tests {
     }
 
     #[test]
-    fn double_click_finishes_on_canvas_toolbar_and_text_input() {
-        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    fn preview_damage_matches_a_full_repaint_through_transforms_and_text_changes() {
+        fn check_update(
+            editor: &mut Editor,
+            incremental: &Bitmap,
+            full: &Bitmap,
+            action: impl FnOnce(&mut Editor),
+        ) -> Vec<Area> {
+            let before = editor.preview_snapshot();
+            action(editor);
+            let mut damage = Vec::new();
+            editor.repaint_changes(before, |area| damage.push(area));
+            assert!(!damage.is_empty());
+            let rectangles: Vec<_> = damage.iter().map(|area| area.rect()).collect();
+            editor.paint(incremental.dc, &rectangles);
+            editor.paint(full.dc, &[editor.desktop.local_bounds().rect()]);
+            unsafe { GdiFlush() };
+            assert!(incremental
+                .bytes()
+                .chunks_exact(4)
+                .zip(full.bytes().chunks_exact(4))
+                .all(|(actual, expected)| actual[..3] == expected[..3]));
+            damage
+        }
 
-        let mut editor = editor_with_selection();
-        let instance = unsafe { GetModuleHandleW(null()) };
-        register(instance).unwrap();
-        let hwnd = unsafe {
-            CreateWindowExW(
-                0,
-                wide(CLASS).as_ptr(),
-                null(),
-                WS_POPUP,
-                0,
-                0,
-                editor.desktop.width(),
-                editor.desktop.height(),
-                null_mut(),
-                null_mut(),
-                instance,
-                null(),
-            )
+        let mut editor = editor_with_overlay();
+        let desktop = editor.desktop;
+        let crop = editor.selection.unwrap();
+        let incremental = Bitmap::new(desktop.width(), desktop.height()).unwrap();
+        let full = Bitmap::new(desktop.width(), desktop.height()).unwrap();
+        editor.paint(incremental.dc, &[desktop.local_bounds().rect()]);
+        let mark_start = Point { x: 30, y: 37 };
+        let mark_end = Point { x: 58, y: 58 };
+        check_update(&mut editor, &incremental, &full, |editor| {
+            editor.mouse_down(mark_start);
+            editor.mouse_up(mark_end);
+            editor.perform_click(Button::Tool(Tool::Select));
+        });
+        let grab = Point { x: 40, y: 37 };
+        let moved = grab + Point { x: 42, y: 22 };
+        check_update(&mut editor, &incremental, &full, |editor| {
+            editor.mouse_down(grab)
+        });
+        check_update(&mut editor, &incremental, &full, |editor| {
+            editor.mouse_move(moved)
+        });
+        check_update(&mut editor, &incremental, &full, |editor| {
+            editor.mouse_up(moved)
+        });
+        check_update(&mut editor, &incremental, &full, |editor| {
+            editor.perform_click(Button::Swatch(rgb(80, 120, 200)));
+        });
+
+        check_update(&mut editor, &incremental, &full, |editor| {
+            editor.perform_click(Button::Tool(Tool::Text));
+            editor
+                .text
+                .open(editor.hwnd, editor.original.dc, crop, Point { x: 9, y: 20 });
+            let source = editor.text.hwnd();
+            unsafe { SetWindowTextW(source, wide("中文").as_ptr()) };
+            editor.text.refresh(editor.original.dc, source);
+        });
+        let draft = editor.text.preview().unwrap().1.bounds();
+        check_update(&mut editor, &incremental, &full, |editor| {
+            use windows_sys::Win32::UI::Controls::EM_SETSEL;
+            let source = editor.text.hwnd();
+            unsafe { SendMessageW(source, EM_SETSEL, 0, 1) };
+            editor.text.refresh(editor.original.dc, source);
+        });
+        assert_eq!(editor.text.preview().unwrap().1.bounds(), draft);
+
+        let damage = check_update(&mut editor, &incremental, &full, |editor| {
+            editor.text.blink()
+        });
+        assert_eq!(damage.len(), 1);
+        assert_eq!(damage[0].width(), 1);
+        assert!(editor.close_text(false));
+        unsafe { DestroyWindow(editor.hwnd) };
+    }
+
+    #[test]
+    fn text_padding_yields_to_text_that_fits_on_one_line() {
+        let mut editor = editor_with_overlay();
+        let font = editor.text.font().unwrap();
+        let units = ['中' as u16; 2];
+        let width = unsafe {
+            let dc = editor.original.dc;
+            let previous = SelectObject(dc, font.handle);
+            let width = text::measure(dc, &units);
+            SelectObject(dc, previous);
+            width
         };
-        assert!(!hwnd.is_null());
-        editor.hwnd = hwnd;
+        let mut crop = editor.selection.unwrap();
+        crop.bottom = crop.top + font.line_height;
+        for (available, fits) in [(width, true), (width + 4, true), (width - 1, false)] {
+            crop.right = crop.left + available;
+            editor.selection = Some(crop);
+            editor
+                .text
+                .open(editor.hwnd, editor.original.dc, crop, Point { x: 0, y: 0 });
+            unsafe { SetWindowTextW(editor.text.hwnd(), wide("中中").as_ptr()) };
+            editor.text.refresh(editor.original.dc, editor.text.hwnd());
+            assert_eq!(editor.text.preview().unwrap().1.overflows(), !fits);
+            assert_eq!(editor.close_text(true), fits);
+            if fits {
+                assert_eq!(
+                    editor.annotations.marks().last().unwrap().bounds().width(),
+                    width
+                );
+            } else {
+                assert!(editor.close_text(false));
+            }
+        }
+        assert_eq!(editor.annotations.marks().len(), 2);
+        unsafe { DestroyWindow(editor.hwnd) };
+    }
+
+    #[test]
+    fn text_caret_blinks_inside_the_selection_outline() {
+        let mut editor = editor_with_overlay();
+        let font = editor.text.font().unwrap();
+        let mut crop = editor.selection.unwrap();
+        crop.right = crop.left + font.chinese_width + 1;
+        crop.bottom = crop.top + font.line_height;
+        editor.selection = Some(crop);
+        editor
+            .text
+            .open(editor.hwnd, editor.original.dc, crop, Point { x: 0, y: 0 });
+        unsafe { SendMessageW(editor.text.hwnd(), WM_CHAR, '中' as WPARAM, 1) };
+        editor.text.refresh(editor.original.dc, editor.text.hwnd());
+        let caret = editor.text.preview().unwrap().1.caret_bounds();
+        let point = caret.origin() + crop.origin();
+        let preview = Bitmap::new(crop.right, crop.bottom).unwrap();
+        editor.paint(preview.dc, &[crop.rect()]);
+        assert_eq!(
+            unsafe { GetPixel(preview.dc, point.x, point.y) },
+            SELECTION_BORDER
+        );
+        editor.text.blink();
+        editor.paint(preview.dc, &[Area::pixel(point).rect()]);
+        assert_ne!(
+            unsafe { GetPixel(preview.dc, point.x, point.y) },
+            SELECTION_BORDER
+        );
+        assert_eq!(
+            caret.intersection(crop.local_bounds().padded(-1)),
+            Some(caret)
+        );
+        assert!(editor.close_text(false));
+        unsafe { DestroyWindow(editor.hwnd) };
+    }
+
+    #[test]
+    fn double_click_finishes_on_canvas_toolbar_and_text_input() {
+        let mut editor = editor_with_overlay();
+        let hwnd = editor.hwnd;
         editor.toolbar = Some(Point { x: 10, y: 107 });
         let selection = editor.selection.unwrap();
         let anchor = Point {
-            x: selection.width() - 2 * editor.font.as_ref().unwrap().chinese_width - 5,
+            x: selection.width() - 2 * editor.text.font().unwrap().chinese_width - 16,
             y: 20,
         };
-        editor.add_mark(Mark::text(
+        editor.annotations.add(Mark::text(
             TextMark::new(
                 editor.original.dc,
-                editor.font.as_ref().unwrap(),
+                editor.text.font().unwrap(),
                 selection,
                 Point { x: 0, y: 0 },
                 "test".encode_utf16().collect(),
@@ -1689,6 +1721,14 @@ mod tests {
         let send_mouse = |message, point: Point| unsafe {
             SendMessageW(hwnd, message, 0, ((point.y << 16) | point.x) as LPARAM);
         };
+        let send_edit_key = |hwnd, key: u16| {
+            assert!(handle_edit_key(&MSG {
+                hwnd,
+                message: WM_KEYDOWN,
+                wParam: usize::from(key),
+                ..MSG::default()
+            }));
+        };
         EDITOR.with(|slot| slot.replace(Some(editor)));
 
         let outside = Point { x: 0, y: 0 };
@@ -1703,7 +1743,7 @@ mod tests {
                 let mut slot = slot.borrow_mut();
                 let editor = slot.as_mut().unwrap();
                 assert_eq!(editor.finished.take(), Some(true));
-                assert_eq!(editor.marks.len(), mark_count);
+                assert_eq!(editor.annotations.marks().len(), mark_count);
                 assert_eq!(editor.tool, tool);
             });
         };
@@ -1715,16 +1755,34 @@ mod tests {
         }
 
         let mut edit = null_mut();
+        let mut caret = selection.origin();
         with_editor(|editor| {
             editor.tool = Tool::Text;
-            editor.open_text(selection, anchor);
-            let input = editor.text.as_ref().unwrap();
-            edit = input.hwnd;
-            assert_eq!(
-                input.draft.bounds().width(),
-                editor.font.as_ref().unwrap().chinese_width
-            );
+            editor
+                .text
+                .open(editor.hwnd, editor.original.dc, selection, anchor);
+            let input = editor.text.preview().unwrap().1;
+            edit = editor.text.hwnd();
+            assert!(input.bounds().width() > editor.text.font().unwrap().chinese_width);
+            let bar = input.caret_bounds();
+            assert_eq!(input.bounds().padded(-3).intersection(bar), Some(bar));
+            caret = caret + bar.origin();
         });
+        let preview = Bitmap::new(selection.right, selection.bottom).unwrap();
+        let caret_color = || {
+            with_editor(|editor| editor.paint(preview.dc, &[Area::pixel(caret).rect()]));
+            unsafe { GetPixel(preview.dc, caret.x, caret.y) }
+        };
+        assert_eq!(caret_color(), SELECTION_BORDER);
+        unsafe { SendMessageW(hwnd, WM_TIMER, CARET_TIMER, 0) };
+        assert_eq!(caret_color(), 0);
+        unsafe { SendMessageW(hwnd, WM_TIMER, CARET_TIMER, 0) };
+        assert_eq!(caret_color(), SELECTION_BORDER);
+        unsafe {
+            SendMessageW(hwnd, WM_TIMER, CARET_TIMER, 0);
+            SendMessageW(hwnd, text::UPDATED, edit as WPARAM, 0);
+        }
+        assert_eq!(caret_color(), SELECTION_BORDER);
         unsafe {
             for unit in "中文标注".encode_utf16() {
                 SendMessageW(edit, WM_CHAR, unit as WPARAM, 1);
@@ -1737,11 +1795,15 @@ mod tests {
             DispatchMessageW(&updated);
         }
         with_editor(|editor| {
-            let bounds = editor.text.as_ref().unwrap().draft.bounds();
-            let font = editor.font.as_ref().unwrap();
+            let input = editor.text.preview().unwrap().1;
+            let bounds = input.bounds();
+            let bar = input.caret_bounds();
+            let font = editor.text.font().unwrap();
             assert!(bounds.width() > font.chinese_width);
             assert!(bounds.right <= selection.width());
+            assert!(bounds.height() <= selection.height());
             assert!(bounds.height() > font.line_height);
+            assert_eq!(bounds.padded(-3).intersection(bar), Some(bar));
             assert_eq!(
                 crate::control_text(edit),
                 "中文标注".encode_utf16().collect::<Vec<_>>()
@@ -1758,33 +1820,43 @@ mod tests {
 
         with_editor(|editor| {
             editor.tool = Tool::Text;
-            editor.open_text(selection, anchor);
-            edit = editor.text.as_ref().unwrap().hwnd;
+            editor
+                .text
+                .open(editor.hwnd, editor.original.dc, selection, anchor);
+            edit = editor.text.hwnd();
         });
-        unsafe {
-            SetWindowTextW(edit, wide("\r\n\r\n\r\n\r\n\r\n文字").as_ptr());
-            SendMessageW(hwnd, TEXT_FINISHED, 1, 0);
-        }
+        unsafe { SetWindowTextW(edit, wide("\r\n\r\n\r\n\r\n\r\n文字").as_ptr()) };
+        send_edit_key(edit, VK_RETURN);
         send_mouse(WM_LBUTTONDBLCLK, draft_point);
         with_editor(|editor| {
             assert_eq!(editor.finished, None);
-            assert_eq!(editor.marks.len(), 2);
-            assert!(editor.text.as_ref().unwrap().overflows(selection));
+            assert_eq!(editor.annotations.marks().len(), 2);
+            assert!(editor.text.preview().unwrap().1.overflows());
         });
-        unsafe {
-            SetWindowTextW(edit, wide("文字").as_ptr());
-            SendMessageW(hwnd, TEXT_FINISHED, 1, 0);
-        }
+        unsafe { SetWindowTextW(edit, wide("文字").as_ptr()) };
+        send_edit_key(edit, VK_RETURN);
         with_editor(|editor| {
-            assert!(editor.text.is_none());
-            assert_eq!(editor.marks.len(), 3);
+            assert!(!editor.text.is_open());
+            assert_eq!(editor.annotations.marks().len(), 3);
             assert_eq!(editor.tool, Tool::Text);
         });
 
-        let next_anchor = Point { x: 30, y: 35 };
+        let next_anchor = Point {
+            x: selection.right - 2,
+            y: selection.bottom - 2,
+        };
         send_mouse(WM_LBUTTONDOWN, next_anchor);
-        with_editor(|editor| assert!(editor.text.is_some()));
-        unsafe { SendMessageW(hwnd, TEXT_FINISHED, 0, 0) };
+        with_editor(|editor| {
+            let input = editor.text.preview().unwrap().1;
+            edit = editor.text.hwnd();
+            let bounds = input.bounds();
+            let bar = input.caret_bounds();
+            assert_eq!(bounds.intersection(selection.local_bounds()), Some(bounds));
+            assert_eq!(bounds.right, selection.width());
+            assert_eq!(bounds.bottom, selection.height());
+            assert_eq!(bounds.padded(-3).intersection(bar), Some(bar));
+        });
+        send_edit_key(edit, VK_ESCAPE);
 
         send_mouse(WM_LBUTTONDOWN, cancel);
         send_mouse(WM_LBUTTONUP, cancel);

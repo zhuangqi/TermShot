@@ -1,5 +1,5 @@
-use super::{strokes, Area, Font, Point, TextMark};
-use crate::appearance::{fill, ACCENT, WHITE};
+use super::{strokes, text::TextMark, Area, Font, Point};
+use crate::appearance::{fill, rgb, WHITE};
 use std::rc::Rc;
 use windows_sys::Win32::Foundation::COLORREF;
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -7,6 +7,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const HANDLE_RADIUS: i32 = 4;
 const HIT_RADIUS: i32 = 6;
+const CONTROL_OUTLINE: COLORREF = rgb(24, 24, 28);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Tool {
@@ -15,7 +16,6 @@ pub(super) enum Tool {
     Arrow,
     Pen,
     Text,
-    Eraser,
 }
 
 #[derive(Clone)]
@@ -41,14 +41,14 @@ enum Shape {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Handle {
+enum Handle {
     Frame(Edge, Edge),
     Tail,
     Tip,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Edge {
+enum Edge {
     First,
     Center,
     Last,
@@ -129,7 +129,7 @@ impl Mark {
         }
     }
 
-    pub fn hit(&self, point: Point) -> bool {
+    fn hit(&self, point: Point) -> bool {
         match &self.shape {
             Shape::Rectangle(bounds) => {
                 let corners = [bounds.left, bounds.right - 1].map(|x| {
@@ -174,7 +174,7 @@ impl Mark {
         }
     }
 
-    pub fn contains_rectangle(&self, point: Point) -> bool {
+    fn contains_rectangle(&self, point: Point) -> bool {
         matches!(self.shape, Shape::Rectangle(bounds) if bounds.contains(point))
     }
 
@@ -209,7 +209,7 @@ impl Mark {
         .into()
     }
 
-    pub fn handle_at(&self, point: Point, crop: Area) -> Option<Handle> {
+    fn handle_at(&self, point: Point, crop: Area) -> Option<Handle> {
         self.handles(crop)
             .into_iter()
             .filter_map(|(handle, center)| {
@@ -221,7 +221,7 @@ impl Mark {
             .map(|(_, handle)| handle)
     }
 
-    pub fn transform(&self, handle: Option<Handle>, delta: Point, crop: Area) -> Option<Self> {
+    fn transform(&self, handle: Option<Handle>, delta: Point, crop: Area) -> Option<Self> {
         let bounds = self.bounds();
         let shape = match (&self.shape, handle) {
             (Shape::Arrow(start, end), Some(Handle::Tail | Handle::Tip)) => {
@@ -377,20 +377,22 @@ impl Mark {
     pub unsafe fn paint_controls(&self, dc: HDC, crop: Area) {
         if !matches!(self.shape, Shape::Arrow(..)) {
             let frame = control_frame(self.bounds(), crop);
-            let pen = CreatePen(PS_DOT, 1, ACCENT);
-            if !pen.is_null() {
-                let previous = SelectObject(dc, pen);
-                let brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-                let mode = SetBkMode(dc, TRANSPARENT as i32);
-                Rectangle(dc, frame.left, frame.top, frame.right, frame.bottom);
-                SetBkMode(dc, mode);
-                SelectObject(dc, brush);
-                SelectObject(dc, previous);
-                DeleteObject(pen);
+            let brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            let mode = SetBkMode(dc, TRANSPARENT as i32);
+            for (style, color) in [(PS_SOLID, CONTROL_OUTLINE), (PS_DOT, WHITE)] {
+                let pen = CreatePen(style, 1, color);
+                if !pen.is_null() {
+                    let previous = SelectObject(dc, pen);
+                    Rectangle(dc, frame.left, frame.top, frame.right, frame.bottom);
+                    SelectObject(dc, previous);
+                    DeleteObject(pen);
+                }
             }
+            SetBkMode(dc, mode);
+            SelectObject(dc, brush);
         }
         for (_, center) in self.handles(crop) {
-            let outer = point_bounds(
+            let bounds = point_bounds(
                 center
                     - Point {
                         x: HANDLE_RADIUS,
@@ -402,20 +404,14 @@ impl Mark {
                         y: HANDLE_RADIUS,
                     },
             );
-            fill(dc, &outer.rect(), ACCENT);
-            let inner = Area {
-                left: outer.left + 1,
-                top: outer.top + 1,
-                right: outer.right - 1,
-                bottom: outer.bottom - 1,
-            };
-            fill(dc, &inner.rect(), WHITE);
+            fill(dc, &bounds.rect(), CONTROL_OUTLINE);
+            fill(dc, &bounds.padded(-1).rect(), WHITE);
         }
     }
 }
 
 impl Handle {
-    pub fn cursor(self) -> *const u16 {
+    fn cursor(self) -> *const u16 {
         use Edge::Center;
         match self {
             Self::Tail | Self::Tip => IDC_SIZEALL,
@@ -537,14 +533,201 @@ fn arrow_head(start: Point, end: Point) -> [Point; 3] {
     ]
 }
 
-pub(super) enum Change {
+#[derive(Default)]
+pub(super) struct Annotations {
+    marks: Vec<Mark>,
+    selected: Option<usize>,
+    undo: Vec<Change>,
+    redo: Vec<Change>,
+    changed_bounds: Vec<Area>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct MarkDrag {
+    index: usize,
+    handle: Option<Handle>,
+}
+
+impl MarkDrag {
+    pub fn cursor(self) -> *const u16 {
+        self.handle.map_or(IDC_SIZEALL, Handle::cursor)
+    }
+}
+
+pub(super) struct AnnotationView<'a> {
+    marks: &'a [Mark],
+    selected: Option<usize>,
+    replacement: Option<(usize, Mark)>,
+}
+
+impl AnnotationView<'_> {
+    fn visible(&self, index: usize) -> &Mark {
+        self.replacement
+            .as_ref()
+            .filter(|(changed, _)| *changed == index)
+            .map_or(&self.marks[index], |(_, mark)| mark)
+    }
+
+    pub fn marks(&self) -> impl Iterator<Item = &Mark> {
+        (0..self.marks.len()).map(|index| self.visible(index))
+    }
+
+    pub fn selected(&self) -> Option<(usize, &Mark)> {
+        let index = self.selected?;
+        Some((index, self.visible(index)))
+    }
+
+    pub fn replacement(&self) -> Option<(&Mark, &Mark)> {
+        let (index, mark) = self.replacement.as_ref()?;
+        Some((&self.marks[*index], mark))
+    }
+}
+
+impl Annotations {
+    pub fn marks(&self) -> &[Mark] {
+        &self.marks
+    }
+
+    pub fn selected(&self) -> Option<&Mark> {
+        self.selected.map(|index| &self.marks[index])
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected = None;
+    }
+
+    pub fn view(&self, drag: Option<(MarkDrag, Point)>, crop: Area) -> AnnotationView<'_> {
+        let replacement = drag.and_then(|(drag, delta)| {
+            self.transformed(drag, delta, crop)
+                .map(|mark| (drag.index, mark))
+        });
+        AnnotationView {
+            marks: &self.marks,
+            selected: self.selected,
+            replacement,
+        }
+    }
+
+    fn hit(&self, point: Point) -> Option<usize> {
+        self.marks
+            .iter()
+            .rposition(|mark| mark.hit(point))
+            .or_else(|| {
+                self.selected
+                    .filter(|&index| self.marks[index].bounds().contains(point))
+            })
+            .or_else(|| {
+                self.marks
+                    .iter()
+                    .rposition(|mark| mark.contains_rectangle(point))
+            })
+    }
+
+    pub fn cursor_at(&self, point: Point, crop: Area) -> *const u16 {
+        if let Some(handle) = self.selected().and_then(|mark| mark.handle_at(point, crop)) {
+            handle.cursor()
+        } else if self.hit(point).is_some() {
+            IDC_SIZEALL
+        } else {
+            IDC_ARROW
+        }
+    }
+
+    pub fn begin_transform(&mut self, point: Point, crop: Area) -> Option<MarkDrag> {
+        let handle = self.selected().and_then(|mark| mark.handle_at(point, crop));
+        if handle.is_none() {
+            self.selected = self.hit(point);
+        }
+        Some(MarkDrag {
+            index: self.selected?,
+            handle,
+        })
+    }
+
+    fn transformed(&self, drag: MarkDrag, delta: Point, crop: Area) -> Option<Mark> {
+        self.marks
+            .get(drag.index)?
+            .transform(drag.handle, delta, crop)
+    }
+
+    pub fn finish_transform(&mut self, drag: MarkDrag, delta: Point, crop: Area) {
+        if let Some(mark) = self.transformed(drag, delta, crop) {
+            self.change(Change::Replace(drag.index, mark));
+        }
+    }
+
+    pub fn add(&mut self, mark: Mark) {
+        self.change(Change::Insert(self.marks.len(), mark));
+    }
+
+    pub fn delete_selected(&mut self) {
+        if let Some(index) = self.selected.take() {
+            self.change(Change::Remove(index));
+        }
+    }
+
+    pub fn recolor_selected(&mut self, color: COLORREF) {
+        if let Some(index) = self
+            .selected
+            .filter(|&index| self.marks[index].color != color)
+        {
+            let mut mark = self.marks[index].clone();
+            mark.color = color;
+            self.change(Change::Replace(index, mark));
+        }
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    pub fn undo(&mut self) {
+        if let Some(change) = self.undo.pop() {
+            let inverse = self.apply(change);
+            self.redo.push(inverse);
+            self.clear_selection();
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if let Some(change) = self.redo.pop() {
+            let inverse = self.apply(change);
+            self.undo.push(inverse);
+            self.clear_selection();
+        }
+    }
+
+    pub fn drain_changed_bounds(&mut self) -> impl Iterator<Item = Area> + '_ {
+        self.changed_bounds.drain(..)
+    }
+
+    fn change(&mut self, change: Change) {
+        let inverse = self.apply(change);
+        self.undo.push(inverse);
+        self.redo.clear();
+    }
+
+    fn apply(&mut self, change: Change) -> Change {
+        let (inverse, before, after) = change.apply(&mut self.marks);
+        self.changed_bounds.extend(before);
+        self.changed_bounds
+            .extend(after.filter(|area| Some(*area) != before));
+        inverse
+    }
+}
+
+enum Change {
     Insert(usize, Mark),
     Remove(usize),
     Replace(usize, Mark),
 }
 
 impl Change {
-    pub fn apply(self, marks: &mut Vec<Mark>) -> (Self, Option<Area>, Option<Area>) {
+    fn apply(self, marks: &mut Vec<Mark>) -> (Self, Option<Area>, Option<Area>) {
         match self {
             Self::Insert(index, mark) => {
                 let after = mark.paint_bounds();
@@ -563,5 +746,66 @@ impl Change {
                 (Self::Replace(index, replaced), Some(before), Some(after))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topmost_mark_wins_and_a_new_edit_clears_redo() {
+        let mut annotations = Annotations::default();
+        let crop = Area {
+            left: 0,
+            top: 0,
+            right: 120,
+            bottom: 100,
+        };
+        let bounds = Area {
+            left: 20,
+            top: 20,
+            right: 80,
+            bottom: 60,
+        };
+        let point = Point { x: 45, y: 20 };
+        let delta = Point { x: 9, y: 12 };
+        let back = rgb(20, 40, 60);
+        let front = rgb(100, 120, 140);
+        let replacement = rgb(150, 170, 190);
+        annotations.add(Mark::rectangle(bounds, back));
+        annotations.add(Mark::rectangle(bounds, front));
+
+        let drag = annotations.begin_transform(point, crop).unwrap();
+        let view = annotations.view(Some((drag, delta)), crop);
+        assert_eq!(
+            view.marks().map(Mark::bounds).collect::<Vec<_>>(),
+            [bounds, bounds.offset(delta)]
+        );
+        assert_eq!(annotations.selected().unwrap().color, front);
+        annotations.finish_transform(drag, delta, crop);
+        assert_eq!(annotations.marks()[1].bounds(), bounds.offset(delta));
+
+        annotations.undo();
+        assert!(annotations.selected().is_none());
+        assert_eq!(annotations.marks()[1].bounds(), bounds);
+        assert!(annotations.can_redo());
+        annotations.begin_transform(point, crop).unwrap();
+        annotations.recolor_selected(front);
+        assert!(annotations.can_redo());
+        annotations.recolor_selected(replacement);
+        assert!(!annotations.can_redo());
+
+        annotations.delete_selected();
+        assert_eq!(annotations.marks().len(), 1);
+        annotations.undo();
+        assert_eq!(
+            annotations
+                .marks()
+                .iter()
+                .map(|mark| mark.color)
+                .collect::<Vec<_>>(),
+            [back, replacement],
+        );
     }
 }

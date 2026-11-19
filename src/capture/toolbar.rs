@@ -59,7 +59,6 @@ impl Button {
             Self::Tool(Tool::Arrow) => w!("画箭头"),
             Self::Tool(Tool::Pen) => w!("画笔"),
             Self::Tool(Tool::Text) => w!("添加文字"),
-            Self::Tool(Tool::Eraser) => w!("擦除标注"),
             Self::Palette => w!("选择颜色"),
             Self::Undo => w!("撤销"),
             Self::Redo => w!("重做"),
@@ -70,7 +69,7 @@ impl Button {
     }
 }
 
-const BUTTONS: [Button; 12] = [
+const BUTTONS: [Button; 11] = [
     Button::Grip,
     Button::Tool(Tool::Select),
     Button::Tool(Tool::Rectangle),
@@ -78,7 +77,6 @@ const BUTTONS: [Button; 12] = [
     Button::Tool(Tool::Pen),
     Button::Tool(Tool::Text),
     Button::Palette,
-    Button::Tool(Tool::Eraser),
     Button::Undo,
     Button::Redo,
     Button::Cancel,
@@ -504,10 +502,6 @@ fn icon_paths(button: Button) -> &'static [IconPath] {
             &[&[(2, 13), (5, 6), (7, 5), (8, 11), (10, 12), (12, 7), (15, 5)]]
         }
         Button::Tool(Tool::Text) => &[&[(2, 3), (14, 3)], &[(8, 3), (8, 14)], &[(5, 14), (11, 14)]],
-        Button::Tool(Tool::Eraser) => &[
-            &[(1, 10), (9, 2), (15, 8), (9, 14), (5, 14), (1, 10)],
-            &[(5, 6), (12, 12)],
-        ],
         Button::Undo => &[
             &[(1, 6), (10, 6), (13, 8), (13, 12), (11, 14), (7, 14)],
             &[(5, 2), (1, 6), (5, 10)],

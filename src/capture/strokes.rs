@@ -8,7 +8,7 @@ use windows_sys::Win32::Graphics::GdiPlus::{self as gdip, *};
 pub(super) use gdip::PointF;
 
 const STROKE_WIDTH: i32 = 3;
-pub(super) const PEN_MARGIN: i32 = 3;
+const PEN_MARGIN: i32 = 3;
 const SEGMENTS_PER_BLOCK: usize = 32;
 
 pub(super) struct LivePen {
@@ -44,6 +44,16 @@ impl LivePen {
 
     pub fn paint_bounds(&self) -> Option<Area> {
         (self.points.len() > 1).then(|| self.bounds.padded(PEN_MARGIN))
+    }
+
+    pub fn damage_from(&self, previous_points: usize) -> Option<Area> {
+        self.points
+            .get(previous_points.saturating_sub(1)..)?
+            .iter()
+            .copied()
+            .map(Area::pixel)
+            .reduce(Area::union)
+            .map(|area| area.padded(PEN_MARGIN))
     }
 
     pub fn visible_points(&self, clip: Area) -> Option<&[Point]> {
