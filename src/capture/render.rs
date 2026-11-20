@@ -1,6 +1,6 @@
 use super::{
-    annotations::AnnotationView, strokes, text, toolbar, Area, DragKind, Editor, Mark, Point,
-    SELECTION_BORDER,
+    annotations::{AnnotationView, LiveDrawing},
+    strokes, text, toolbar, Area, Editor, Mark, Point, SELECTION_BORDER,
 };
 use crate::{appearance, storage::wide};
 use std::io;
@@ -27,20 +27,39 @@ struct Scene<'a> {
 struct CropScene<'a> {
     crop: Area,
     annotations: AnnotationView<'a>,
-    drawing: Option<LiveDrawing<'a>>,
-    draft: Option<(u64, &'a text::TextDraft)>,
+    draft: Option<DraftPreview<'a>>,
     ink: COLORREF,
 }
 
-enum LiveDrawing<'a> {
-    Pen(&'a strokes::LivePen),
-    Shape(Mark),
+struct DraftPreview<'a> {
+    revision: u64,
+    text: &'a text::TextDraft,
+    bounds: Area,
+    caret: Option<Area>,
+}
+
+impl<'a> DraftPreview<'a> {
+    fn new((revision, text): (u64, &'a text::TextDraft)) -> Self {
+        Self {
+            revision,
+            text,
+            bounds: text.bounds(),
+            caret: text.visible_caret(),
+        }
+    }
+
+    fn visible_in(&self, area: Area) -> bool {
+        self.bounds.intersection(area).is_some()
+            || self
+                .caret
+                .is_some_and(|caret| caret.intersection(area).is_some())
+    }
 }
 
 impl LiveDrawing<'_> {
     fn bounds(&self) -> Option<Area> {
         match self {
-            Self::Pen(stroke) => stroke.paint_bounds(),
+            Self::Pen { stroke, .. } => stroke.paint_bounds(),
             Self::Shape(mark) => Some(mark.paint_bounds()),
         }
     }
@@ -52,20 +71,20 @@ impl CropScene<'_> {
         Some((index, mark, mark.controls_bounds(self.crop.local_bounds())))
     }
 
-    fn pen(&self) -> Option<&strokes::LivePen> {
-        match &self.drawing {
-            Some(LiveDrawing::Pen(stroke)) => Some(stroke),
+    fn pen(&self) -> Option<(u64, &strokes::LivePen)> {
+        match &self.annotations.drawing {
+            Some(LiveDrawing::Pen { id, stroke }) => Some((*id, stroke)),
             _ => None,
         }
     }
 }
 
-pub(super) struct PreviewSnapshot {
+struct PreviewSnapshot {
     selection: Option<Area>,
     toolbar: Option<(toolbar::Layout, toolbar::State)>,
     controls: Option<(usize, Area)>,
     drag: Option<Area>,
-    pen: Option<(usize, COLORREF)>,
+    pen: Option<(u64, usize, COLORREF)>,
     hidden_mark: Option<Area>,
     draft: Option<(Area, COLORREF, u64)>,
     caret: Option<Area>,
@@ -111,6 +130,7 @@ impl Scene<'_> {
                 .controls()
                 .and_then(|(index, _, bounds)| Some((index, on_screen(bounds)?)));
             preview.drag = content
+                .annotations
                 .drawing
                 .as_ref()
                 .and_then(LiveDrawing::bounds)
@@ -123,10 +143,13 @@ impl Scene<'_> {
                         .union(changed.controls_bounds(content.crop.local_bounds())),
                 );
             }
-            preview.pen = content.pen().map(|pen| (pen.points.len(), content.ink));
-            if let Some((revision, draft)) = content.draft {
-                preview.draft = on_screen(draft.bounds()).map(|area| (area, content.ink, revision));
-                preview.caret = draft.visible_caret().and_then(on_screen);
+            preview.pen = content
+                .pen()
+                .map(|(id, pen)| (id, pen.points.len(), content.ink));
+            if let Some(draft) = &content.draft {
+                preview.draft =
+                    on_screen(draft.bounds).map(|area| (area, content.ink, draft.revision));
+                preview.caret = draft.caret.and_then(on_screen);
             }
         }
         preview
@@ -163,11 +186,13 @@ impl Scene<'_> {
             |area| area,
             &mut repaint,
         );
-        if let (Some((old, color)), Some((new, next_color))) = (before.pen, after.pen) {
-            if color == next_color && new >= old {
+        if let (Some((id, old, color)), Some((next_id, new, next_color))) = (before.pen, after.pen)
+        {
+            if id == next_id && color == next_color && new >= old {
                 if new > old {
                     if let Some(area) = self.content.as_ref().and_then(|content| {
-                        let damage = content.pen()?.damage_from(old)?;
+                        let (_, pen) = content.pen()?;
+                        let damage = pen.damage_from(old)?;
                         in_overlay(content.crop, damage)
                     }) {
                         repaint(area);
@@ -276,26 +301,11 @@ impl Editor {
 
     fn scene(&self) -> Scene<'_> {
         let selection = self.preview_selection();
-        let content = self.selection.map(|crop| {
-            let mut transform = None;
-            let mut drawing = None;
-            if let Some(drag) = &self.drag {
-                match &drag.kind {
-                    DragKind::Mark(mark) => transform = Some((*mark, drag.delta())),
-                    DragKind::Pen(stroke) => drawing = Some(LiveDrawing::Pen(stroke)),
-                    DragKind::Draw(_) => {
-                        drawing = drag.drawn_mark(crop, self.color).map(LiveDrawing::Shape)
-                    }
-                    _ => {}
-                }
-            }
-            CropScene {
-                crop,
-                annotations: self.annotations.view(transform, crop.local_bounds()),
-                drawing,
-                draft: self.text.preview(),
-                ink: self.color,
-            }
+        let content = self.selection.map(|crop| CropScene {
+            crop,
+            annotations: self.annotations.view(self.color),
+            draft: self.text.preview().map(DraftPreview::new),
+            ink: self.color,
         });
         Scene {
             selection,
@@ -305,15 +315,16 @@ impl Editor {
         }
     }
 
-    pub(super) fn preview_snapshot(&self) -> PreviewSnapshot {
-        self.scene().snapshot()
-    }
-
-    pub(super) fn repaint_changes(
+    pub(super) fn edit_preview(
         &mut self,
-        before: PreviewSnapshot,
+        edit: impl FnOnce(&mut Self),
         mut repaint: impl FnMut(Area),
     ) {
+        let before = self.scene().snapshot();
+        edit(self);
+        if self.finished.is_some() {
+            return;
+        }
         let desktop = self.desktop.local_bounds();
         let mut repaint = |area: Area| {
             if let Some(visible) = area.intersection(desktop) {
@@ -488,31 +499,28 @@ impl Editor {
             }
         };
         content.annotations.marks().for_each(paint);
-        match &content.drawing {
-            Some(LiveDrawing::Pen(stroke))
-                if stroke
-                    .paint_bounds()
-                    .is_some_and(|bounds| bounds.intersection(visible).is_some()) =>
-            {
-                if let Some(points) = stroke.visible_points(visible) {
-                    strokes::paint(dc, local, content.ink, self.antialias(), &[points]);
+        if let Some(drawing) = content.annotations.drawing.as_ref().filter(|drawing| {
+            drawing
+                .bounds()
+                .is_some_and(|bounds| bounds.intersection(visible).is_some())
+        }) {
+            match drawing {
+                LiveDrawing::Pen { stroke, .. } => {
+                    if let Some(points) = stroke.visible_points(visible) {
+                        strokes::paint(dc, local, content.ink, self.antialias(), &[points]);
+                    }
                 }
+                LiveDrawing::Shape(mark) => mark.paint(dc, font, local, self.antialias()),
             }
-            Some(LiveDrawing::Shape(mark)) => paint(mark),
-            _ => {}
         }
         if let Some((_, mark, bounds)) = content.controls() {
             if bounds.intersection(visible).is_some() {
                 mark.paint_controls(dc, local);
             }
         }
-        if let (Some((_, draft)), Some(font)) = (content.draft, font) {
-            if draft.bounds().intersection(visible).is_some()
-                || draft
-                    .visible_caret()
-                    .is_some_and(|caret| caret.intersection(visible).is_some())
-            {
-                draft.paint(dc, font, content.ink);
+        if let (Some(draft), Some(font)) = (&content.draft, font) {
+            if draft.visible_in(visible) {
+                draft.text.paint(dc, font, content.ink);
             }
         }
         RestoreDC(dc, state);

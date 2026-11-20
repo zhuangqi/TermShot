@@ -1,0 +1,90 @@
+name: Desktop builds
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Build Windows installer
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw "Tag must match Cargo version v$version" }
+          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          & $compiler "/DAppVersion=$version" installer/TermShot.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: github.ref_type == 'tag'
+        with:
+          name: windows-installer
+          path: target/installer/TermShot-*-Windows-x64-Setup.exe
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-26
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --locked
+      - if: github.ref_type != 'tag'
+        run: sh macos/build-app.sh
+      - name: Compare direct and composed Retina crops
+        run: |
+          xcrun clang -fobjc-arc macos/Snapshot.m macos/SnapshotTests.m -o "$RUNNER_TEMP/snapshot-tests" -framework Foundation -framework CoreFoundation -framework VideoToolbox -framework CoreGraphics -framework CoreVideo
+          "$RUNNER_TEMP/snapshot-tests"
+      - name: Build universal macOS disk image
+        if: github.ref_type == 'tag'
+        run: sh macos/build-app.sh --dmg
+      - uses: actions/upload-artifact@v4
+        if: github.ref_type == 'tag'
+        with:
+          name: macos-installer
+          path: target/installer/TermShot-*-macOS-Universal.dmg
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: '*-installer'
+          merge-multiple: true
+      - name: Attach both installers to the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          windows="dist/TermShot-$version-Windows-x64-Setup.exe"
+          macos="dist/TermShot-$version-macOS-Universal.dmg"
+          test -s "$windows" && test -s "$macos" || exit 1
+          if state=$(gh release view "$tag" --json isDraft --jq .isDraft); then
+            if [[ "$state" != true ]]; then
+              echo "::error::Release $tag has already been published."
+              exit 1
+            fi
+            gh release upload "$tag" "$windows" "$macos" --clobber
+          else
+            gh release create "$tag" "$windows" "$macos" --draft --verify-tag \
+              --title "TermShot $tag" --generate-notes \
+              --notes 'Windows 10/11 x64 安装程序。macOS 14+ 通用 DMG 为开发预览，支持 Apple Silicon 和 Intel，未经过 Apple 公证。'
+          fi

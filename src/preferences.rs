@@ -37,9 +37,6 @@ const ICON_SIZE: i32 = 24;
 const LABEL_X: i32 = CONTENT_LEFT + ICON_SIZE + 8;
 const LABEL_WIDTH: i32 = 88;
 const KEY_WIDTH: i32 = 60;
-const KEY_ARROW_WIDTH: i32 = 22;
-const KEY_LIST_ROW_HEIGHT: i32 = 24;
-const KEY_LIST_VISIBLE_ROWS: i32 = 8;
 const CTRL: i32 = 201;
 const SHIFT: i32 = 202;
 const ALT: i32 = 203;
@@ -99,19 +96,10 @@ const CONTROLS: [(i32, &str, &str, u32, Bounds); 11] = [
     ),
     (
         KEY,
-        "COMBOBOX",
+        "BUTTON",
         "",
-        CBS_DROPDOWNLIST as u32
-            | CBS_OWNERDRAWFIXED as u32
-            | CBS_HASSTRINGS as u32
-            | WS_TABSTOP
-            | WS_VSCROLL,
-        (
-            KEY_X,
-            SHORTCUT_TOP,
-            KEY_WIDTH,
-            FIELD_HEIGHT + KEY_LIST_VISIBLE_ROWS * KEY_LIST_ROW_HEIGHT + 4,
-        ),
+        WS_TABSTOP,
+        (KEY_X, SHORTCUT_TOP, KEY_WIDTH, FIELD_HEIGHT),
     ),
     (
         RETENTION_LABEL,
@@ -346,31 +334,7 @@ pub fn open(instance: HINSTANCE, initial: Settings) -> io::Result<HWND> {
             };
             SendMessageW(GetDlgItem(hwnd, id), BM_SETCHECK, checked as usize, 0);
         }
-        let key_list = GetDlgItem(hwnd, KEY);
-        SendMessageW(
-            key_list,
-            CB_SETMINVISIBLE,
-            KEY_LIST_VISIBLE_ROWS as usize,
-            0,
-        );
-        let mut combo = COMBOBOXINFO {
-            cbSize: size_of::<COMBOBOXINFO>() as u32,
-            ..Default::default()
-        };
-        if GetComboBoxInfo(key_list, &mut combo) != 0 {
-            SetWindowTheme(combo.hwndList, wide("DarkMode_Explorer").as_ptr(), null());
-        }
-        for (index, key) in keys().enumerate() {
-            SendMessageW(
-                key_list,
-                CB_ADDSTRING,
-                0,
-                wide(key_label(key)).as_ptr() as isize,
-            );
-            if key == initial.hotkey.key {
-                SendMessageW(key_list, CB_SETCURSEL, index, 0);
-            }
-        }
+        set_primary_key(GetDlgItem(hwnd, KEY), initial.hotkey.key);
         let minutes = GetDlgItem(hwnd, MINUTES);
         SendMessageW(minutes, EM_SETLIMITTEXT, 10, 0);
         SendMessageW(
@@ -408,8 +372,20 @@ pub fn open(instance: HINSTANCE, initial: Settings) -> io::Result<HWND> {
     }
 }
 
+unsafe fn set_primary_key(field: HWND, key: u32) {
+    SetWindowLongPtrW(field, GWLP_USERDATA, key as isize);
+    SetWindowTextW(field, wide(key_label(key)).as_ptr());
+    InvalidateRect(field, null(), 0);
+}
+
 pub fn handle_key(message: &MSG) -> bool {
-    let hwnd = with_app(|app| app.preferences).unwrap_or(null_mut());
+    handle_dialog_key(
+        with_app(|app| app.preferences).unwrap_or(null_mut()),
+        message,
+    )
+}
+
+fn handle_dialog_key(hwnd: HWND, message: &MSG) -> bool {
     if hwnd.is_null() {
         return false;
     }
@@ -418,11 +394,14 @@ pub fn handle_key(message: &MSG) -> bool {
             return false;
         }
         let key = message.wParam as u16;
+        if message.message == WM_KEYDOWN
+            && message.hwnd == GetDlgItem(hwnd, KEY)
+            && keys().any(|allowed| allowed == u32::from(key))
+        {
+            set_primary_key(message.hwnd, u32::from(key));
+            return true;
+        }
         if message.message == WM_KEYDOWN && matches!(key, VK_ESCAPE | VK_RETURN) {
-            let list = GetDlgItem(hwnd, KEY);
-            if SendMessageW(list, CB_GETDROPPEDSTATE, 0, 0) != 0 {
-                return false;
-            }
             let command = if key == VK_ESCAPE || message.hwnd == GetDlgItem(hwnd, IDCANCEL) {
                 IDCANCEL
             } else {
@@ -445,7 +424,7 @@ unsafe extern "system" fn window_proc(
     match message {
         WM_PAINT if !style.is_null() => paint_page(hwnd, &*style),
         WM_ERASEBKGND => return 1,
-        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX if !style.is_null() => {
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT if !style.is_null() => {
             let (background, brush) = if message == WM_CTLCOLORSTATIC {
                 (PANEL, (*style).row)
             } else {
@@ -455,18 +434,10 @@ unsafe extern "system" fn window_proc(
             SetBkColor(wparam as HDC, background);
             return brush as LRESULT;
         }
-        WM_MEASUREITEM if lparam != 0 && !style.is_null() => {
-            let item = &mut *(lparam as *mut MEASUREITEMSTRUCT);
-            if item.CtlID as i32 == KEY {
-                item.itemHeight = scale(KEY_LIST_ROW_HEIGHT, (*style).dpi) as u32;
-                return 1;
-            }
-        }
         WM_DRAWITEM if lparam != 0 && !style.is_null() => {
             let item = &*(lparam as *const DRAWITEMSTRUCT);
             match item.CtlID as i32 {
                 IDOK | IDCANCEL => paint_action(item, &*style),
-                KEY => paint_key_option(item, &*style),
                 _ => return DefWindowProcW(hwnd, message, wparam, lparam),
             }
             return 1;
@@ -478,9 +449,6 @@ unsafe extern "system" fn window_proc(
             }
             (id @ (CTRL | SHIFT | ALT | STARTUP), BN_CLICKED) => {
                 InvalidateRect(GetDlgItem(hwnd, id), null(), 0);
-            }
-            (KEY, CBN_SELCHANGE | CBN_DROPDOWN | CBN_CLOSEUP) => {
-                InvalidateRect(GetDlgItem(hwnd, KEY), null(), 0);
             }
             (MINUTES, EN_SETFOCUS | EN_KILLFOCUS) if !style.is_null() => {
                 InvalidateRect(hwnd, &rect(NUMBER_FIELD, (*style).dpi), 0);
@@ -562,7 +530,7 @@ unsafe extern "system" fn control_proc(
     let result = DefSubclassProc(hwnd, message, wparam, lparam);
     if matches!(
         message,
-        WM_MOUSELEAVE | WM_SETFOCUS | WM_KILLFOCUS | BM_SETCHECK | BM_SETSTATE | CB_SETCURSEL
+        WM_MOUSELEAVE | WM_SETFOCUS | WM_KILLFOCUS | BM_SETCHECK | BM_SETSTATE
     ) {
         InvalidateRect(hwnd, null(), 0);
     }
@@ -744,7 +712,20 @@ unsafe fn paint_control(hwnd: HWND, id: i32, style: &Style) {
     } else {
         let caption = String::from_utf16_lossy(&control_text(hwnd));
         if id == KEY {
-            paint_combo(dc, hwnd, client, &caption, style);
+            let edge = if GetFocus() == hwnd {
+                FOCUS_BORDER
+            } else {
+                CONTROL_BORDER
+            };
+            let surface = if is_hovered(hwnd) { HOVER } else { FIELD };
+            style.round(
+                dc,
+                &client,
+                scale(CONTROL_DIAMETER, style.dpi),
+                surface,
+                edge,
+            );
+            text(dc, style.body, &caption, client, TEXT, DT_CENTER);
         } else {
             paint_modifier(dc, hwnd, client, &caption, style);
         }
@@ -834,83 +815,6 @@ unsafe fn paint_modifier(dc: HDC, hwnd: HWND, bounds: RECT, caption: &str, style
     );
 }
 
-unsafe fn paint_combo(dc: HDC, hwnd: HWND, bounds: RECT, caption: &str, style: &Style) {
-    let dpi = style.dpi;
-    let expanded = SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0;
-    let hovered = is_hovered(hwnd);
-    let (surface, border, ink) = if expanded {
-        (selected_fill(hovered), SELECTED_BORDER, SELECTED_TEXT)
-    } else {
-        (if hovered { HOVER } else { FIELD }, CONTROL_BORDER, TEXT)
-    };
-    let edge = if GetFocus() == hwnd {
-        FOCUS_BORDER
-    } else {
-        border
-    };
-    style.round(dc, &bounds, scale(CONTROL_DIAMETER, dpi), surface, edge);
-    let split = bounds.right - scale(KEY_ARROW_WIDTH, dpi);
-    fill(
-        dc,
-        &RECT {
-            left: split,
-            right: split + scale(1, dpi),
-            top: scale(8, dpi),
-            bottom: bounds.bottom - scale(8, dpi),
-        },
-        border,
-    );
-    let center_x = KEY_WIDTH - KEY_ARROW_WIDTH / 2;
-    let center_y = FIELD_HEIGHT / 2;
-    let (ends, tip) = if expanded { (2, -2) } else { (-2, 2) };
-    style.stroke(
-        dc,
-        &[
-            (center_x - 4, center_y + ends),
-            (center_x, center_y + tip),
-            (center_x + 4, center_y + ends),
-        ],
-        ink,
-    );
-    text(
-        dc,
-        style.body,
-        caption,
-        RECT {
-            right: split,
-            ..bounds
-        },
-        ink,
-        DT_CENTER,
-    );
-}
-
-unsafe fn paint_key_option(item: &DRAWITEMSTRUCT, style: &Style) {
-    if item.itemState & ODS_COMBOBOXEDIT != 0 {
-        return;
-    }
-    let selected = item.itemState & ODS_SELECTED != 0;
-    let dpi = style.dpi;
-    fill(item.hDC, &item.rcItem, FIELD);
-    if selected {
-        let mut highlight = item.rcItem;
-        InflateRect(&mut highlight, -scale(4, dpi), -scale(2, dpi));
-        style.round(
-            item.hDC,
-            &highlight,
-            scale(CONTROL_DIAMETER, dpi),
-            selected_fill(false),
-            SELECTED_BORDER,
-        );
-    }
-    if let Some(key) = keys().nth(item.itemID as usize) {
-        let mut bounds = item.rcItem;
-        bounds.left += scale(11, dpi);
-        let ink = if selected { SELECTED_TEXT } else { TEXT };
-        text(item.hDC, style.body, &key_label(key), bounds, ink, DT_LEFT);
-    }
-}
-
 unsafe fn paint_action(item: &DRAWITEMSTRUCT, style: &Style) {
     let pressed = item.itemState & ODS_SELECTED != 0;
     let focused = item.itemState & ODS_FOCUS != 0;
@@ -965,10 +869,9 @@ unsafe fn save(hwnd: HWND, initial_startup: Option<bool>) {
             modifiers |= flag;
         }
     }
-    let index = SendMessageW(GetDlgItem(hwnd, KEY), CB_GETCURSEL, 0, 0);
     let hotkey = Hotkey {
         modifiers,
-        key: keys().nth(index as usize).unwrap_or_default(),
+        key: GetWindowLongPtrW(GetDlgItem(hwnd, KEY), GWLP_USERDATA) as u32,
     };
     if !hotkey.valid() {
         alert(hwnd, "请为截图快捷键选择至少一个修饰键和一个主键。");
@@ -998,7 +901,10 @@ unsafe fn save(hwnd: HWND, initial_startup: Option<bool>) {
     }) {
         Some(Ok(())) => {
             if let Some(owner) = with_app(|app| app.hwnd) {
-                crate::request_cleanup(owner);
+                crate::update_cleanup(
+                    owner,
+                    crate::cleanup::Event::RetentionChanged(retention_minutes),
+                );
             }
             DestroyWindow(hwnd);
         }
@@ -1038,26 +944,6 @@ unsafe fn layout(hwnd: HWND) {
     if !dc.is_null() {
         ReleaseDC(hwnd, dc);
     }
-    let combo = GetDlgItem(hwnd, KEY);
-    let mut collapsed = RECT::default();
-    GetClientRect(combo, &mut collapsed);
-    let item_height = SendMessageW(combo, CB_GETITEMHEIGHT, usize::MAX, 0) as i32;
-    let desired = rect((KEY_X, SHORTCUT_TOP, KEY_WIDTH, FIELD_HEIGHT), style.dpi);
-    let height_difference = desired.bottom - desired.top - collapsed.bottom;
-    if height_difference != 0 && item_height > 0 {
-        SendMessageW(
-            combo,
-            CB_SETITEMHEIGHT,
-            usize::MAX,
-            (item_height + height_difference).max(1) as isize,
-        );
-    }
-    SendMessageW(
-        combo,
-        CB_SETITEMHEIGHT,
-        0,
-        scale(KEY_LIST_ROW_HEIGHT, style.dpi) as isize,
-    );
     RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
 }
 
@@ -1091,4 +977,66 @@ fn rect((x, y, width, height): Bounds, dpi: u32) -> RECT {
 
 fn scale(value: i32, dpi: u32) -> i32 {
     (value * dpi as i32 + 48) / 96
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn primary_key_input_and_dialog_commands() {
+        unsafe {
+            let dialog = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                100,
+                50,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            );
+            assert!(!dialog.is_null());
+            let field = create_control(
+                dialog,
+                "BUTTON",
+                "",
+                WS_TABSTOP,
+                KEY as usize,
+                (0, 0, 60, 28),
+            );
+            assert!(!field.is_null());
+            let press = |vk: u16| {
+                handle_dialog_key(
+                    dialog,
+                    &MSG {
+                        hwnd: field,
+                        message: WM_KEYDOWN,
+                        wParam: usize::from(vk),
+                        ..Default::default()
+                    },
+                )
+            };
+            for (vk, label) in [(b'A' as u16, "A"), (b'9' as u16, "9"), (VK_F11, "F11")] {
+                assert!(press(vk));
+                assert_eq!(GetWindowLongPtrW(field, GWLP_USERDATA), vk as isize);
+                assert_eq!(String::from_utf16_lossy(&control_text(field)), label);
+            }
+            for (vk, command) in [(VK_RETURN, IDOK), (VK_ESCAPE, IDCANCEL)] {
+                assert!(press(vk));
+                let mut message = MSG::default();
+                assert_ne!(
+                    PeekMessageW(&mut message, dialog, WM_COMMAND, WM_COMMAND, PM_REMOVE),
+                    0
+                );
+                assert_eq!(message.wParam, command as usize);
+                assert_eq!(GetWindowLongPtrW(field, GWLP_USERDATA), VK_F11 as isize);
+            }
+            DestroyWindow(dialog);
+        }
+    }
 }

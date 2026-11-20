@@ -1,9 +1,6 @@
-use crate::{
-    capture::Image,
-    storage::{SavedCapture, Storage},
-};
+use crate::{capture::Image, cleanup::Scan, files::SavedCapture, storage::Storage};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,12 +8,9 @@ use windows_sys::Win32::Foundation::{GetLastError, ERROR_NOT_ENOUGH_QUOTA, HWND}
 use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 pub const READY: u32 = WM_APP + 4;
-const SAVE_BYTE_LIMIT: usize = 64 * 1024 * 1024;
-const SAVE_JOB_LIMIT: usize = 3;
-
 enum Job {
     Save(Image),
-    Clean,
+    Clean(Scan),
 }
 
 pub enum Outcome {
@@ -29,17 +23,15 @@ pub struct Background {
     outcomes: mpsc::Receiver<(Outcome, usize)>,
     saving: usize,
     save_bytes: usize,
-    retention: Arc<AtomicU32>,
     stopped: Arc<AtomicBool>,
 }
 
 impl Background {
-    pub fn start(owner: HWND, storage: Storage, retention: Option<u32>) -> io::Result<Self> {
+    pub fn start(owner: HWND, storage: Storage) -> io::Result<Self> {
         let (jobs, queue) = mpsc::channel();
         let (completed, outcomes) = mpsc::channel();
-        let retention = Arc::new(AtomicU32::new(retention.unwrap_or(0)));
         let stopped = Arc::new(AtomicBool::new(false));
-        let (policy, shutdown) = (Arc::clone(&retention), Arc::clone(&stopped));
+        let shutdown = Arc::clone(&stopped);
         let owner = owner as usize;
         thread::Builder::new()
             .name("capture-storage".into())
@@ -52,20 +44,8 @@ impl Background {
                         Job::Save(image) => {
                             (Outcome::Saved(storage.save_png(&image)), image.byte_len())
                         }
-                        Job::Clean => {
-                            let minutes = policy.load(Ordering::Acquire);
-                            let started = Instant::now();
-                            let deadline = (minutes != 0)
-                                .then(|| {
-                                    storage.clean(minutes, || {
-                                        !shutdown.load(Ordering::Acquire)
-                                            && policy.load(Ordering::Acquire) == minutes
-                                    })
-                                })
-                                .flatten()
-                                .and_then(|delay| {
-                                    started.checked_add(Duration::from_millis(delay))
-                                });
+                        Job::Clean(scan) => {
+                            let deadline = scan.run(&storage, || !shutdown.load(Ordering::Acquire));
                             (Outcome::Cleaned(deadline), 0)
                         }
                     };
@@ -88,18 +68,12 @@ impl Background {
             outcomes,
             saving: 0,
             save_bytes: 0,
-            retention,
             stopped,
         })
     }
 
     pub fn save_budget(&self) -> usize {
-        match self.saving {
-            // A single large multi-monitor screenshot can exceed the shared budget.
-            0 => usize::MAX,
-            SAVE_JOB_LIMIT.. => 0,
-            _ => SAVE_BYTE_LIMIT.saturating_sub(self.save_bytes),
-        }
+        crate::files::save_budget(self.saving, self.save_bytes)
     }
 
     pub fn is_saving(&self) -> bool {
@@ -120,8 +94,8 @@ impl Background {
         Ok(())
     }
 
-    pub fn clean(&self) -> io::Result<()> {
-        self.enqueue(Job::Clean)
+    pub fn clean(&self, scan: Scan) -> io::Result<()> {
+        self.enqueue(Job::Clean(scan))
     }
 
     pub fn receive(&mut self) -> Option<Outcome> {
@@ -131,10 +105,6 @@ impl Background {
             self.save_bytes -= bytes;
         }
         Some(outcome)
-    }
-
-    pub fn set_retention(&self, minutes: u32) {
-        self.retention.store(minutes, Ordering::Release);
     }
 
     fn enqueue(&self, job: Job) -> io::Result<()> {

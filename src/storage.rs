@@ -1,15 +1,11 @@
 use crate::capture::Image;
+use crate::files::*;
 use crate::{APP_NAME, LEGACY_APP_NAME};
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::os::windows::{
-    ffi::OsStrExt,
-    fs::{MetadataExt, OpenOptionsExt},
-};
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::GlobalFree;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -24,11 +20,6 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 
 const CF_UNICODETEXT: u32 = 13;
-const DELETE_RETRY_MS: u64 = 30_000;
-const CAPTURE_TEMP: &str = "capture-tmp";
-const LEGACY_HEADER_BYTES: u64 = 128;
-static SEQUENCE: AtomicU32 = AtomicU32::new(0);
-
 pub fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
 }
@@ -100,17 +91,6 @@ pub struct Storage {
     pub captures: PathBuf,
 }
 
-pub struct SavedCapture {
-    pub path: PathBuf,
-    saved_at: u64,
-}
-
-impl SavedCapture {
-    pub fn expires_in(&self, minutes: u32) -> Duration {
-        Duration::from_millis(remaining_ms(self.saved_at, minutes, now_ms()))
-    }
-}
-
 impl Storage {
     pub fn open() -> io::Result<Self> {
         let local_app_data = std::env::var_os("LOCALAPPDATA")
@@ -173,122 +153,21 @@ impl Storage {
     }
 
     pub fn save_png(&self, image: &Image) -> io::Result<SavedCapture> {
-        fs::create_dir_all(&self.captures)?;
-        let temporary_dir = self.root.join(CAPTURE_TEMP);
-        fs::create_dir_all(&temporary_dir)?;
-        if !is_private_temp_dir(&temporary_dir)? {
-            return Err(io::Error::other("截图临时目录必须是普通目录"));
-        }
-        let pid = std::process::id();
-        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = temporary_dir.join(format!("shot-{}-{pid}-{sequence}.part", now_ms()));
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .share_mode(0)
-            .open(&temporary)?;
-        let result = (|| {
-            let mut buffered = BufWriter::new(file);
-            write_png(&mut buffered, image)?;
-            buffered.flush()?;
-            drop(buffered);
-            let saved_at = now_ms();
-            let path = self
-                .captures
-                .join(format!("shot-{saved_at}-{pid}-{sequence}.png"));
-            if unsafe { MoveFileExW(wide(&temporary).as_ptr(), wide(&path).as_ptr(), 0) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(SavedCapture { path, saved_at })
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        save_capture(&self.root, &self.captures, |output| {
+            write_png(output, image)
+        })
     }
 
     pub fn clean(&self, retention_minutes: u32, current: impl Fn() -> bool) -> Option<u64> {
-        let now = now_ms();
-        let mut next = clean_at(&self.captures, retention_minutes, now, false, &current);
-        if let Some(delay) = clean_at(
-            &self.root.join(CAPTURE_TEMP),
-            retention_minutes,
-            now,
-            true,
-            current,
-        ) {
-            schedule(&mut next, delay);
-        }
-        next
+        clean_captures(&self.root, &self.captures, retention_minutes, current)
     }
 }
 
 fn write_png(output: impl Write, image: &Image) -> io::Result<()> {
-    let mut encoder = png::Encoder::new(output, image.width, image.height);
-    encoder.set_color(png::ColorType::Rgb);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder
-        .add_text_chunk("Software".to_owned(), APP_NAME.to_owned())
-        .map_err(io::Error::other)?;
-    let mut writer = encoder.write_header().map_err(io::Error::other)?;
-    image.with_rows(|rows| {
-        let mut stream = writer
-            .stream_writer_with_size(64 * 1024)
-            .map_err(io::Error::other)?;
-        let mut rgb = vec![0; image.width as usize * 3];
-        for row in rows {
-            for (pixel, target) in row.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
-                target.copy_from_slice(&[pixel[2], pixel[1], pixel[0]]);
-            }
-            stream.write_all(&rgb)?;
-        }
-        stream.finish().map_err(io::Error::other)
-    })?;
-    writer.finish().map_err(io::Error::other)
+    image.with_rows(|rows| crate::files::write_png(output, image.width, image.height, rows))
 }
 
-fn is_capture(path: &Path) -> io::Result<bool> {
-    let file = BufReader::new(File::open(path)?);
-    match png::Decoder::new(file).read_info() {
-        Ok(reader) => Ok(has_software_marker(reader.info())),
-        Err(png::DecodingError::IoError(error)) if error.kind() != io::ErrorKind::UnexpectedEof => {
-            Err(error)
-        }
-        Err(_) => Ok(false),
-    }
-}
-
-fn has_software_marker(info: &png::Info<'_>) -> bool {
-    info.uncompressed_latin1_text.iter().any(|text| {
-        text.keyword == "Software" && matches!(text.text.as_str(), APP_NAME | LEGACY_APP_NAME)
-    })
-}
-
-fn is_legacy_part(path: &Path) -> io::Result<bool> {
-    // The old writer put the marker immediately after IHDR, even if it was killed before IDAT.
-    let mut bytes = Vec::with_capacity(LEGACY_HEADER_BYTES as usize);
-    File::open(path)?
-        .take(LEGACY_HEADER_BYTES)
-        .read_to_end(&mut bytes)?;
-    let mut input = bytes.as_slice();
-    let mut decoder = png::StreamingDecoder::new();
-    while !input.is_empty() {
-        match decoder.update(input, None) {
-            Ok((_, png::Decoded::ChunkComplete(png::chunk::tEXt)))
-                if decoder.info().is_some_and(has_software_marker) =>
-            {
-                return Ok(true)
-            }
-            Ok((_, png::Decoded::ChunkBegin(_, png::chunk::IDAT | png::chunk::IEND))) | Err(_) => {
-                break
-            }
-            Ok((count, _)) => input = &input[count..],
-        }
-    }
-    Ok(false)
-}
-
-fn is_private_temp_dir(path: &Path) -> io::Result<bool> {
+pub(crate) fn is_private_temp_dir(path: &Path) -> io::Result<bool> {
     let metadata = fs::symlink_metadata(path)?;
     Ok(metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0)
 }
@@ -317,107 +196,6 @@ fn parse_settings(contents: &str) -> io::Result<Settings> {
         io::ErrorKind::InvalidData,
         "无效的快捷键或保留时间",
     ))
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn remaining_ms(saved_at: u64, minutes: u32, now: u64) -> u64 {
-    saved_at
-        .saturating_add(u64::from(minutes) * 60_000)
-        .saturating_sub(now)
-}
-
-fn capture_timestamp(path: &Path, suffix: &str) -> Option<u64> {
-    let name = path
-        .file_name()?
-        .to_str()?
-        .strip_prefix("shot-")?
-        .strip_suffix(suffix)?;
-    let mut fields = name.split('-');
-    let timestamp = fields.next()?.parse().ok()?;
-    fields.next()?.parse::<u32>().ok()?;
-    fields.next()?.parse::<u32>().ok()?;
-    fields.next().is_none().then_some(timestamp)
-}
-
-fn clean_at(
-    directory: &Path,
-    minutes: u32,
-    now: u64,
-    temporary: bool,
-    current: impl Fn() -> bool,
-) -> Option<u64> {
-    if temporary {
-        match is_private_temp_dir(directory) {
-            Ok(true) => (),
-            Ok(false) => return None,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
-            Err(_) => return Some(DELETE_RETRY_MS),
-        }
-    }
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
-        Err(_) => return Some(DELETE_RETRY_MS),
-    };
-    let mut next = None;
-    for entry in entries {
-        if !current() {
-            return None;
-        }
-        let Ok(entry) = entry else {
-            schedule(&mut next, DELETE_RETRY_MS);
-            continue;
-        };
-        let path = entry.path();
-        let part = capture_timestamp(&path, ".part");
-        let saved_at = if temporary {
-            part
-        } else {
-            part.or_else(|| capture_timestamp(&path, ".png"))
-        };
-        let Some(saved_at) = saved_at else {
-            continue;
-        };
-        match entry.file_type() {
-            Ok(kind) if kind.is_file() => (),
-            Ok(_) => continue,
-            Err(_) => {
-                schedule(&mut next, DELETE_RETRY_MS);
-                continue;
-            }
-        }
-        let remaining = remaining_ms(saved_at, minutes, now);
-        if remaining > 0 {
-            schedule(&mut next, remaining);
-            continue;
-        }
-        let marked = match (temporary, part.is_some()) {
-            (true, _) => Ok(true),
-            (false, true) => is_legacy_part(&path),
-            (false, false) => is_capture(&path),
-        };
-        let result = marked.and_then(|is_capture| {
-            if is_capture && current() {
-                fs::remove_file(&path)
-            } else {
-                Ok(())
-            }
-        });
-        if result.is_err_and(|error| error.kind() != io::ErrorKind::NotFound) {
-            schedule(&mut next, DELETE_RETRY_MS);
-        }
-    }
-    next
-}
-
-fn schedule(next: &mut Option<u64>, delay: u64) {
-    *next = Some(next.map_or(delay, |current| current.min(delay)));
 }
 
 pub enum ClipboardError {
@@ -464,6 +242,9 @@ unsafe fn set_clipboard_text(text: &[u16]) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::background::{Background, Outcome, READY};
+    use crate::cleanup::{Cleanup, Event};
+    use std::io::BufReader;
+    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
 
     fn sample_image() -> Image {
         Image::from_bgra(1, 1, vec![56, 34, 12, 0])
@@ -473,6 +254,7 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, PeekMessageW, HWND_MESSAGE, MSG, PM_REMOVE,
     };
@@ -669,6 +451,13 @@ mod tests {
         fs::create_dir_all(&captures).unwrap();
         let expired = captures.join("shot-100000-23-0.png");
         write_png(File::create(&expired).unwrap(), &sample_image()).unwrap();
+        let locked = captures.join("shot-100000-23-1.png");
+        write_png(File::create(&locked).unwrap(), &sample_image()).unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&locked)
+            .unwrap();
         let hwnd = unsafe {
             CreateWindowExW(
                 0,
@@ -692,7 +481,6 @@ mod tests {
                 root: root.clone(),
                 captures: captures.clone(),
             },
-            Some(1),
         )
         .unwrap();
         for _ in 0..3 {
@@ -703,8 +491,12 @@ mod tests {
             background.save(sample_image()).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
-        background.clean().unwrap();
-        let mut receive = || {
+        let mut cleanup = Cleanup::new(Some(5));
+        let requested_at = Instant::now();
+        cleanup
+            .handle(Event::Request, hwnd, |scan| background.clean(scan))
+            .unwrap();
+        let receive = |background: &mut Background| {
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut message = MSG::default();
             loop {
@@ -720,18 +512,40 @@ mod tests {
         };
         let saved = (0..3)
             .map(|_| {
-                let Outcome::Saved(Ok(saved)) = receive() else {
+                let Outcome::Saved(Ok(saved)) = receive(&mut background) else {
                     panic!("expected saved PNG")
                 };
                 assert!(saved.expires_in(1) <= Duration::from_secs(60));
                 assert!(is_capture(&saved.path).unwrap());
+                cleanup
+                    .handle(Event::Saved(&saved), hwnd, |scan| background.clean(scan))
+                    .unwrap();
                 saved.path
             })
             .collect::<Vec<_>>();
-        assert!(matches!(receive(), Outcome::Cleaned(Some(_))));
+        let Outcome::Cleaned(Some(retry)) = receive(&mut background) else {
+            panic!("expected a cleanup retry deadline")
+        };
+        assert!(retry >= requested_at + Duration::from_secs(30));
+        assert!(retry <= Instant::now() + Duration::from_secs(30));
+        cleanup
+            .handle(Event::ScanFinished(Some(retry)), hwnd, |scan| {
+                background.clean(scan)
+            })
+            .unwrap();
         assert!(!background.is_saving());
         assert_eq!(background.save_budget(), usize::MAX);
         assert!(!expired.exists());
+        assert!(locked.exists());
+        drop(lock);
+        cleanup
+            .handle(Event::Request, hwnd, |scan| background.clean(scan))
+            .unwrap();
+        assert!(matches!(
+            receive(&mut background),
+            Outcome::Cleaned(Some(_))
+        ));
+        assert!(!locked.exists());
         drop(background);
         unsafe { DestroyWindow(hwnd) };
         for path in saved {

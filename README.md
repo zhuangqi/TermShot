@@ -1,10 +1,14 @@
 # TermShot
 
-TermShot 是 Windows 10/11 x64 的托盘截图工具。截图支持矩形、箭头、画笔和文字标注。保存后可把文件路径粘贴到本机终端。
+TermShot 是常驻系统托盘或菜单栏的截图工具，支持 Windows 10/11 x64，并提供 macOS 14+ 开发预览。Windows 版支持矩形、箭头、画笔和文字标注。保存后可把文件路径粘贴到本机终端。
 
-## 安装
+## Windows 安装
 
 在 [GitHub Releases](https://github.com/zhuangqi/TermShot/releases/latest) 下载 `TermShot-*-Windows-x64-Setup.exe` 并运行。安装完成后，从 Windows 开始菜单打开 TermShot。
+
+## macOS 安装
+
+在同一个 [GitHub Release](https://github.com/zhuangqi/TermShot/releases/latest) 下载 `TermShot-*-macOS-Universal.dmg`。打开磁盘映像后，将 TermShot 拖入「应用程序」。此开发预览支持 macOS 14+、Apple Silicon 和 Intel，未经过 Apple 公证，首次打开可能被 Gatekeeper 拦截。
 
 ## 截图
 
@@ -16,7 +20,7 @@ TermShot 是 Windows 10/11 x64 的托盘截图工具。截图支持矩形、箭�
 
 ## 设置与清理
 
-右键点击托盘中的 TermShot 图标，选择「设置」修改全局截图快捷键和自动删除时间。首次运行使用 `Alt+Shift+S`。已经保存过的快捷键可在设置中更换。
+右键点击托盘中的 TermShot 图标，选择「设置」修改全局截图快捷键和自动删除时间。首次运行使用 `Alt+Shift+S`。要更换主键，点击当前主键（或用 Tab 移到该处），直接按下字母、数字或 F1–F11，再保存设置。已经保存过的快捷键可在设置中更换。
 
 「开机启动」默认关闭。开启并保存后，TermShot 会在当前用户登录 Windows 时自动启动到系统托盘。
 
@@ -41,3 +45,20 @@ ISCC.exe "/DAppVersion=$version" installer\TermShot.iss
 ```
 
 安装包位于 `target\installer`。
+
+## macOS 14+ 开发预览
+
+安装 Rust 和 Xcode Command Line Tools 后，在 Mac 上执行：
+
+```sh
+sh macos/build-app.sh
+open target/release/TermShot.app
+```
+
+应用驻留菜单栏。按 `Option+Shift+S` 或点击菜单中的「截图」，首次使用时允许屏幕录制。拖动时会显示最终截图的像素尺寸，松开鼠标保存 PNG 并复制绝对路径。点击浮动提示中的「取消」或按 `Esc` 可退出截图。可跨显示器框选，输出使用选区涉及的最高 backing scale。截图位于 `~/Library/Application Support/TermShot/captures`，默认保留 10 分钟。应用关闭时到期的截图在下次启动时清理。
+
+使用 macOS 26 或更新版本的 SDK 编译后，浮动截图控件在 macOS 26 及更新系统上使用原生 Liquid Glass。macOS 14 和 15 使用系统 HUD 材质。
+
+此构建脚本生成当前 Mac 架构的本地签名应用。Windows 的标注编辑、窗口吸附、自定义快捷键和登录启动目前仅在 Windows 版提供。
+
+发布用通用磁盘映像可用 `sh macos/build-app.sh --dmg` 构建。与 `Cargo.toml` 版本匹配的 `v*` 标签会触发 GitHub Actions，并在两个安装包构建通过后将它们上传到同一个 Release 草稿。

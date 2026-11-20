@@ -19,7 +19,7 @@ mod strokes;
 mod text;
 mod toolbar;
 mod windows;
-use annotations::{Annotations, Mark, MarkDrag, Tool};
+use annotations::{Annotations, Mark, Tool};
 use render::{update_rectangles, Bitmap, Font};
 use text::TextEditor;
 use toolbar::Button;
@@ -217,9 +217,6 @@ impl Area {
 
 enum DragKind {
     Region { box_started: bool },
-    Draw(Tool),
-    Pen(strokes::LivePen),
-    Mark(MarkDrag),
     Toolbar { origin: Point },
 }
 
@@ -230,39 +227,18 @@ struct Drag {
 }
 
 impl Drag {
-    fn update(&mut self, end: Point, crop: Option<Area>) {
+    fn update(&mut self, end: Point) {
         self.end = end;
-        match &mut self.kind {
-            DragKind::Region { box_started } => {
-                *box_started |= unsafe {
-                    (end.x - self.start.x).abs() >= GetSystemMetrics(SM_CXDRAG).max(1)
-                        || (end.y - self.start.y).abs() >= GetSystemMetrics(SM_CYDRAG).max(1)
-                };
-            }
-            DragKind::Pen(stroke) => {
-                if let Some(crop) = crop {
-                    stroke.push(crop.local(end));
-                }
-            }
-            _ => {}
+        if let DragKind::Region { box_started } = &mut self.kind {
+            *box_started |= unsafe {
+                (end.x - self.start.x).abs() >= GetSystemMetrics(SM_CXDRAG).max(1)
+                    || (end.y - self.start.y).abs() >= GetSystemMetrics(SM_CYDRAG).max(1)
+            };
         }
     }
 
     fn delta(&self) -> Point {
         self.end - self.start
-    }
-
-    fn drawn_mark(&self, crop: Area, color: COLORREF) -> Option<Mark> {
-        let DragKind::Draw(tool) = self.kind else {
-            return None;
-        };
-        let start = crop.local(self.start);
-        let end = crop.local(self.end);
-        match tool {
-            Tool::Rectangle => Area::from_drag(start, end).map(|area| Mark::rectangle(area, color)),
-            Tool::Arrow if start != end => Some(Mark::arrow(start, end, color)),
-            _ => None,
-        }
     }
 }
 
@@ -478,7 +454,7 @@ unsafe extern "system" fn window_proc(
             return 1;
         }
         WM_CAPTURECHANGED => edit(|editor| {
-            editor.drag = None;
+            editor.clear_drag();
         }),
         WM_KEYDOWN => edit(|editor| editor.key_down(wparam as u16)),
         WM_IME_SETCONTEXT => {
@@ -523,14 +499,10 @@ fn with_editor(action: impl FnOnce(&mut Editor)) {
 
 fn edit(action: impl FnOnce(&mut Editor)) {
     with_editor(|editor| {
-        let before = editor.preview_snapshot();
-        action(editor);
-        if editor.finished.is_none() {
-            let hwnd = editor.hwnd;
-            editor.repaint_changes(before, |area| unsafe {
-                InvalidateRect(hwnd, &area.rect(), 0);
-            });
-        }
+        let hwnd = editor.hwnd;
+        editor.edit_preview(action, |area| unsafe {
+            InvalidateRect(hwnd, &area.rect(), 0);
+        });
     });
 }
 
@@ -545,7 +517,7 @@ impl Editor {
     fn mouse_down(&mut self, point: Point) {
         self.hide_tooltip();
         self.apply_pending_click();
-        if self.finished.is_some() || self.drag.is_some() {
+        if self.finished.is_some() || self.has_drag() {
             return;
         }
         let Some(crop) = self.selection else {
@@ -571,25 +543,31 @@ impl Editor {
             return;
         }
 
-        match self.tool {
-            Tool::Select => {
-                if let Some(drag) = self.annotations.begin_transform(local, crop.local_bounds()) {
-                    self.begin_drag(point, DragKind::Mark(drag));
-                }
-            }
-            Tool::Text => self.text.open(self.hwnd, self.original.dc, crop, local),
-            Tool::Pen => self.begin_drag(point, DragKind::Pen(strokes::LivePen::new(local))),
-            tool => self.begin_drag(point, DragKind::Draw(tool)),
+        if self.tool == Tool::Text {
+            self.text.open(self.hwnd, self.original.dc, crop, local);
+        } else if self
+            .annotations
+            .begin_gesture(self.tool, local, crop.local_bounds())
+        {
+            self.capture_pointer(point);
         }
     }
 
+    fn has_drag(&self) -> bool {
+        self.drag.is_some() || self.annotations.has_gesture()
+    }
+
     fn begin_drag(&mut self, point: Point, kind: DragKind) {
-        self.hovered = None;
         self.drag = Some(Drag {
             start: point,
             end: point,
             kind,
         });
+        self.capture_pointer(point);
+    }
+
+    fn capture_pointer(&mut self, point: Point) {
+        self.hovered = None;
         unsafe { SetCapture(self.hwnd) };
         self.set_cursor(Some(point));
     }
@@ -598,11 +576,12 @@ impl Editor {
         if self.pointer.replace(point).is_none() {
             self.track_mouse(TME_LEAVE);
         }
-        if let Some(drag) = self.drag.as_mut() {
-            drag.update(point, self.selection);
-            if let DragKind::Toolbar { origin } = drag.kind {
-                let position = origin + drag.delta();
-                self.toolbar = Some(self.clamp_toolbar(position, point));
+        if self.update_drag(point) {
+            if let Some(drag) = &self.drag {
+                if let DragKind::Toolbar { origin } = drag.kind {
+                    let position = origin + drag.delta();
+                    self.toolbar = Some(self.clamp_toolbar(position, point));
+                }
             }
         } else {
             let hovered = self.toolbar_layout().and_then(|layout| layout.hit(point));
@@ -628,7 +607,7 @@ impl Editor {
     }
 
     fn show_tooltip(&mut self, point: Point) {
-        let Some(layout) = self.toolbar_layout().filter(|_| self.drag.is_none()) else {
+        let Some(layout) = self.toolbar_layout().filter(|_| !self.has_drag()) else {
             return;
         };
         let Some(button) = layout
@@ -665,9 +644,11 @@ impl Editor {
         if let Some(drag) = &self.drag {
             return match drag.kind {
                 DragKind::Toolbar { .. } => IDC_SIZEALL,
-                DragKind::Mark(mark) => mark.cursor(),
-                _ => IDC_CROSS,
+                DragKind::Region { .. } => IDC_CROSS,
             };
+        }
+        if let Some(cursor) = self.annotations.gesture_cursor() {
+            return cursor;
         }
         if let Some(point) = point {
             if let Some(layout) = self.toolbar_layout() {
@@ -704,16 +685,29 @@ impl Editor {
     }
 
     fn mouse_up(&mut self, point: Point) {
-        let Some(drag) = self.drag.as_mut() else {
+        if !self.update_drag(point) {
             return;
-        };
-        drag.update(point, self.selection);
+        }
         self.commit_drag();
         self.mouse_move(point);
     }
 
+    fn update_drag(&mut self, point: Point) -> bool {
+        if let Some(drag) = &mut self.drag {
+            drag.update(point);
+        } else if let Some(crop) = self.selection.filter(|_| self.annotations.has_gesture()) {
+            self.annotations.update_gesture(crop.local(point));
+        } else {
+            return false;
+        }
+        true
+    }
+
     fn commit_drag(&mut self) {
         let Some(drag) = self.drag.take() else {
+            if self.annotations.commit_gesture(self.color) {
+                unsafe { ReleaseCapture() };
+            }
             return;
         };
         unsafe { ReleaseCapture() };
@@ -727,30 +721,16 @@ impl Editor {
             DragKind::Toolbar { origin } => {
                 self.toolbar = Some(self.clamp_toolbar(origin + drag.delta(), drag.end));
             }
-            DragKind::Pen(stroke) => {
-                if stroke.points.len() > 1 {
-                    self.annotations.add(Mark::pen(stroke.points, self.color));
-                }
-            }
-            DragKind::Draw(_) => {
-                if let Some(mark) = self
-                    .selection
-                    .and_then(|crop| drag.drawn_mark(crop, self.color))
-                {
-                    self.annotations.add(mark);
-                }
-            }
-            DragKind::Mark(mark) => {
-                if let Some(crop) = self.selection {
-                    self.annotations
-                        .finish_transform(mark, drag.delta(), crop.local_bounds());
-                }
-            }
         }
     }
 
+    fn clear_drag(&mut self) -> bool {
+        let overlay_drag = self.drag.take().is_some();
+        self.annotations.cancel_gesture() || overlay_drag
+    }
+
     fn discard_drag(&mut self) {
-        if self.drag.take().is_some() {
+        if self.clear_drag() {
             unsafe { ReleaseCapture() };
         }
     }
@@ -1463,10 +1443,11 @@ mod tests {
             .collect::<Vec<_>>();
         editor.mouse_down(crop.origin() + points[0]);
         for &point in points.iter().skip(1) {
-            let before = editor.preview_snapshot();
-            editor.mouse_move(crop.origin() + point);
             let mut dirty = Vec::new();
-            editor.repaint_changes(before, |area| dirty.push(area));
+            editor.edit_preview(
+                |editor| editor.mouse_move(crop.origin() + point),
+                |area| dirty.push(area),
+            );
             assert_eq!(dirty.len(), 1);
             assert!(dirty[0].width() <= 8);
             editor.paint(partial.dc, &[dirty[0].rect()]);
@@ -1474,6 +1455,40 @@ mod tests {
         editor.discard_drag();
         editor.annotations.add(Mark::pen(points, editor.color));
         editor.frame = Some(Bitmap::new(desktop.width(), desktop.height()).unwrap());
+        let full = Bitmap::new(desktop.width(), desktop.height()).unwrap();
+        editor.paint(full.dc, &[desktop.rect()]);
+        unsafe { GdiFlush() };
+        assert!(partial
+            .bytes()
+            .chunks_exact(4)
+            .zip(full.bytes().chunks_exact(4))
+            .all(|(actual, expected)| actual[..3] == expected[..3]));
+    }
+
+    #[test]
+    fn replacing_a_live_pen_stroke_repaints_both_strokes() {
+        let mut editor = editor_with_selection();
+        let desktop = editor.desktop.local_bounds();
+        let first = Point { x: 20, y: 30 };
+        let second = Point { x: 75, y: 65 };
+        let delta = Point { x: 12, y: 8 };
+        editor.tool = Tool::Pen;
+        editor.mouse_down(first);
+        editor.mouse_move(first + delta);
+        let partial = Bitmap::new(desktop.width(), desktop.height()).unwrap();
+        editor.paint(partial.dc, &[desktop.rect()]);
+
+        let mut dirty = Vec::new();
+        editor.edit_preview(
+            |editor| {
+                editor.discard_drag();
+                editor.mouse_down(second);
+                editor.mouse_move(second + delta);
+            },
+            |area| dirty.push(area.rect()),
+        );
+        assert_eq!(dirty.len(), 2);
+        editor.paint(partial.dc, &dirty);
         let full = Bitmap::new(desktop.width(), desktop.height()).unwrap();
         editor.paint(full.dc, &[desktop.rect()]);
         unsafe { GdiFlush() };
@@ -1540,10 +1555,8 @@ mod tests {
             full: &Bitmap,
             action: impl FnOnce(&mut Editor),
         ) -> Vec<Area> {
-            let before = editor.preview_snapshot();
-            action(editor);
             let mut damage = Vec::new();
-            editor.repaint_changes(before, |area| damage.push(area));
+            editor.edit_preview(action, |area| damage.push(area));
             assert!(!damage.is_empty());
             let rectangles: Vec<_> = damage.iter().map(|area| area.rect()).collect();
             editor.paint(incremental.dc, &rectangles);
@@ -1577,6 +1590,18 @@ mod tests {
         });
         check_update(&mut editor, &incremental, &full, |editor| {
             editor.mouse_move(moved)
+        });
+        check_update(&mut editor, &incremental, &full, |editor| {
+            editor.discard_drag();
+        });
+        let original = editor.annotations.marks()[0].bounds();
+        assert_eq!(
+            original,
+            Area::from_drag(crop.local(mark_start), crop.local(mark_end)).unwrap()
+        );
+        check_update(&mut editor, &incremental, &full, |editor| {
+            editor.mouse_down(grab);
+            editor.mouse_move(moved);
         });
         check_update(&mut editor, &incremental, &full, |editor| {
             editor.mouse_up(moved)

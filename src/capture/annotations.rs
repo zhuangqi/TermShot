@@ -537,27 +537,57 @@ fn arrow_head(start: Point, end: Point) -> [Point; 3] {
 pub(super) struct Annotations {
     marks: Vec<Mark>,
     selected: Option<usize>,
+    gesture: Option<Gesture>,
+    pen_id: u64,
     undo: Vec<Change>,
     redo: Vec<Change>,
     changed_bounds: Vec<Area>,
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct MarkDrag {
-    index: usize,
-    handle: Option<Handle>,
+enum GestureKind {
+    Rectangle,
+    Arrow,
+    Pen(strokes::LivePen),
+    Transform {
+        index: usize,
+        handle: Option<Handle>,
+    },
 }
 
-impl MarkDrag {
-    pub fn cursor(self) -> *const u16 {
-        self.handle.map_or(IDC_SIZEALL, Handle::cursor)
+struct Gesture {
+    start: Point,
+    end: Point,
+    crop: Area,
+    kind: GestureKind,
+}
+
+impl Gesture {
+    fn shape(&self, color: COLORREF) -> Option<Mark> {
+        match self.kind {
+            GestureKind::Rectangle => {
+                Area::from_drag(self.start, self.end).map(|bounds| Mark::rectangle(bounds, color))
+            }
+            GestureKind::Arrow if self.start != self.end => {
+                Some(Mark::arrow(self.start, self.end, color))
+            }
+            _ => None,
+        }
     }
+}
+
+pub(super) enum LiveDrawing<'a> {
+    Pen {
+        id: u64,
+        stroke: &'a strokes::LivePen,
+    },
+    Shape(Mark),
 }
 
 pub(super) struct AnnotationView<'a> {
     marks: &'a [Mark],
     selected: Option<usize>,
     replacement: Option<(usize, Mark)>,
+    pub drawing: Option<LiveDrawing<'a>>,
 }
 
 impl AnnotationView<'_> {
@@ -596,16 +626,30 @@ impl Annotations {
         self.selected = None;
     }
 
-    pub fn view(&self, drag: Option<(MarkDrag, Point)>, crop: Area) -> AnnotationView<'_> {
-        let replacement = drag.and_then(|(drag, delta)| {
-            self.transformed(drag, delta, crop)
-                .map(|mark| (drag.index, mark))
-        });
-        AnnotationView {
+    pub fn view(&self, color: COLORREF) -> AnnotationView<'_> {
+        let mut view = AnnotationView {
             marks: &self.marks,
             selected: self.selected,
-            replacement,
+            replacement: None,
+            drawing: None,
+        };
+        if let Some(gesture) = &self.gesture {
+            match &gesture.kind {
+                GestureKind::Transform { index, handle } => {
+                    view.replacement = self
+                        .transformed(gesture, *index, *handle)
+                        .map(|mark| (*index, mark));
+                }
+                GestureKind::Pen(stroke) => {
+                    view.drawing = Some(LiveDrawing::Pen {
+                        id: self.pen_id,
+                        stroke,
+                    });
+                }
+                _ => view.drawing = gesture.shape(color).map(LiveDrawing::Shape),
+            }
         }
+        view
     }
 
     fn hit(&self, point: Point) -> Option<usize> {
@@ -633,27 +677,90 @@ impl Annotations {
         }
     }
 
-    pub fn begin_transform(&mut self, point: Point, crop: Area) -> Option<MarkDrag> {
-        let handle = self.selected().and_then(|mark| mark.handle_at(point, crop));
-        if handle.is_none() {
-            self.selected = self.hit(point);
+    pub fn begin_gesture(&mut self, tool: Tool, point: Point, crop: Area) -> bool {
+        if self.gesture.is_some() {
+            return false;
         }
-        Some(MarkDrag {
-            index: self.selected?,
-            handle,
+        let kind = match tool {
+            Tool::Select => {
+                let handle = self.selected().and_then(|mark| mark.handle_at(point, crop));
+                if handle.is_none() {
+                    self.selected = self.hit(point);
+                }
+                let Some(index) = self.selected else {
+                    return false;
+                };
+                GestureKind::Transform { index, handle }
+            }
+            Tool::Rectangle => GestureKind::Rectangle,
+            Tool::Arrow => GestureKind::Arrow,
+            Tool::Pen => {
+                self.pen_id = self.pen_id.wrapping_add(1);
+                GestureKind::Pen(strokes::LivePen::new(point))
+            }
+            Tool::Text => return false,
+        };
+        self.gesture = Some(Gesture {
+            start: point,
+            end: point,
+            crop,
+            kind,
+        });
+        true
+    }
+
+    pub fn has_gesture(&self) -> bool {
+        self.gesture.is_some()
+    }
+
+    pub fn gesture_cursor(&self) -> Option<*const u16> {
+        Some(match self.gesture.as_ref()?.kind {
+            GestureKind::Transform { handle, .. } => handle.map_or(IDC_SIZEALL, Handle::cursor),
+            _ => IDC_CROSS,
         })
     }
 
-    fn transformed(&self, drag: MarkDrag, delta: Point, crop: Area) -> Option<Mark> {
-        self.marks
-            .get(drag.index)?
-            .transform(drag.handle, delta, crop)
+    pub fn update_gesture(&mut self, point: Point) {
+        if let Some(gesture) = &mut self.gesture {
+            gesture.end = point;
+            if let GestureKind::Pen(stroke) = &mut gesture.kind {
+                stroke.push(point);
+            }
+        }
     }
 
-    pub fn finish_transform(&mut self, drag: MarkDrag, delta: Point, crop: Area) {
-        if let Some(mark) = self.transformed(drag, delta, crop) {
-            self.change(Change::Replace(drag.index, mark));
+    fn transformed(&self, gesture: &Gesture, index: usize, handle: Option<Handle>) -> Option<Mark> {
+        self.marks
+            .get(index)?
+            .transform(handle, gesture.end - gesture.start, gesture.crop)
+    }
+
+    pub fn commit_gesture(&mut self, color: COLORREF) -> bool {
+        let Some(gesture) = self.gesture.take() else {
+            return false;
+        };
+        match gesture.kind {
+            GestureKind::Transform { index, handle } => {
+                if let Some(mark) = self.transformed(&gesture, index, handle) {
+                    self.change(Change::Replace(index, mark));
+                }
+            }
+            GestureKind::Pen(stroke) => {
+                if stroke.points.len() > 1 {
+                    self.add(Mark::pen(stroke.points, color));
+                }
+            }
+            _ => {
+                if let Some(mark) = gesture.shape(color) {
+                    self.add(mark);
+                }
+            }
         }
+        true
+    }
+
+    pub fn cancel_gesture(&mut self) -> bool {
+        self.gesture.take().is_some()
     }
 
     pub fn add(&mut self, mark: Mark) {
@@ -776,21 +883,23 @@ mod tests {
         annotations.add(Mark::rectangle(bounds, back));
         annotations.add(Mark::rectangle(bounds, front));
 
-        let drag = annotations.begin_transform(point, crop).unwrap();
-        let view = annotations.view(Some((drag, delta)), crop);
+        assert!(annotations.begin_gesture(Tool::Select, point, crop));
+        annotations.update_gesture(point + delta);
+        let view = annotations.view(front);
         assert_eq!(
             view.marks().map(Mark::bounds).collect::<Vec<_>>(),
             [bounds, bounds.offset(delta)]
         );
         assert_eq!(annotations.selected().unwrap().color, front);
-        annotations.finish_transform(drag, delta, crop);
+        assert!(annotations.commit_gesture(front));
         assert_eq!(annotations.marks()[1].bounds(), bounds.offset(delta));
 
         annotations.undo();
         assert!(annotations.selected().is_none());
         assert_eq!(annotations.marks()[1].bounds(), bounds);
         assert!(annotations.can_redo());
-        annotations.begin_transform(point, crop).unwrap();
+        assert!(annotations.begin_gesture(Tool::Select, point, crop));
+        assert!(annotations.cancel_gesture());
         annotations.recolor_selected(front);
         assert!(annotations.can_redo());
         annotations.recolor_selected(replacement);
