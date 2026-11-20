@@ -52,6 +52,28 @@ fn build_mac() {
         assert!(status.success(), "macOS frontend compilation failed");
         println!("cargo:rustc-link-arg={}", obj.display());
     }
+    // Rust omits the Clang runtime that implements Objective-C availability checks.
+    let runtime = Command::new("xcrun")
+        .args([
+            "--sdk",
+            "macosx",
+            "clang",
+            "-arch",
+            arch,
+            "--print-libgcc-file-name",
+        ])
+        .output()
+        .expect("could not locate the macOS Clang runtime");
+    assert!(runtime.status.success(), "Clang did not report its runtime");
+    let runtime = String::from_utf8(runtime.stdout).expect("invalid Clang runtime path");
+    let runtime = PathBuf::from(runtime.trim());
+    assert!(
+        runtime.is_file(),
+        "missing Clang runtime at {}",
+        runtime.display()
+    );
+    println!("cargo:rustc-link-arg={}", runtime.display());
+
     for framework in [
         "QuartzCore",
         "AppKit",
